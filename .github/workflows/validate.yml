@@ -1,0 +1,50 @@
+name: Validate workflows and scripts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shell-and-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download actionlint
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash -o /tmp/download-actionlint.bash
+          mkdir -p /tmp/actionlint
+          bash /tmp/download-actionlint.bash 1.7.12 /tmp/actionlint
+      - name: Validate GitHub Actions workflows
+        run: /tmp/actionlint/actionlint
+      - name: Validate Bash scripts
+        run: shellcheck scripts/linux.sh tests/*.sh
+      - name: Check external dependencies
+        run: bash tests/dependency_preflight.sh
+      - name: Run behavior and policy tests
+        run: |
+          bash tests/workflow_contract.sh
+          bash tests/script_contract.sh
+          bash tests/tailscale_protocol.sh
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate PowerShell
+        shell: pwsh
+        run: |
+          Invoke-ScriptAnalyzer -Path scripts/windows.ps1 -EnableExit
+          Invoke-ScriptAnalyzer -Path tests/windows_contract.ps1 -EnableExit
+      - name: Run Windows input behavior tests
+        shell: pwsh
+        run: ./tests/windows_contract.ps1

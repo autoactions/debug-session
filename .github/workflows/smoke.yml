@@ -1,0 +1,130 @@
+name: Smoke test Debug Sessions
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to test
+        type: choice
+        options:
+          - both
+          - linux
+          - windows
+        default: both
+        required: true
+      enable_wsl:
+        description: Also test the WSL Environment
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    if: ${{ inputs.platform == 'both' || inputs.platform == 'linux' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: debug-session-linux
+      cancel-in-progress: false
+    env:
+      TAILSCALE_HOSTNAME: debug-session-smoke-linux
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+      TAILSCALE_TAGS: tag:debug-session
+    steps:
+      - name: Set smoke deadline
+        run: echo "SESSION_DEADLINE_EPOCH=$(($(date +%s) + 50 * 60))" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - name: Prepare Stop Signal
+        run: touch "$HOME/STOP_SESSION"
+      - name: Run Linux smoke session
+        env:
+          ACCESS_PROFILE: full
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+          SESSION_PROFILE: developer
+        run: bash scripts/linux.sh run
+      - name: Verify Linux reserved hostname
+        run: |
+          hostname="$(python3 -c 'import json,subprocess,sys; status=json.loads(subprocess.check_output(["tailscale","status","--json"])); print(status["Self"]["HostName"])')"
+          test "$hostname" = debug-session-smoke-linux
+      - name: Verify Linux Developer Profile
+        run: |
+          command -v code
+          command -v codex
+          command -v grok
+          command -v zsh
+          test -d "$HOME/.oh-my-zsh"
+      - name: Clean up Linux smoke session
+        if: ${{ always() }}
+        run: bash scripts/linux.sh cleanup
+      - name: Verify Linux logout
+        if: ${{ always() }}
+        run: |
+          if sudo tailscale status >/dev/null 2>&1; then
+            echo 'Tailscale still reports an active session' >&2
+            exit 1
+          fi
+
+  windows:
+    if: ${{ inputs.platform == 'both' || inputs.platform == 'windows' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    concurrency:
+      group: debug-session-windows
+      cancel-in-progress: false
+    env:
+      TAILSCALE_HOSTNAME: debug-session-smoke-windows
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+      TAILSCALE_TAGS: tag:debug-session
+    steps:
+      - name: Set smoke deadline
+        shell: pwsh
+        run: |
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + (50 * 60)
+          "SESSION_DEADLINE_EPOCH=$deadline" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/checkout@v6
+      - name: Prepare Stop Signal
+        shell: pwsh
+        run: |
+          New-Item -Path "$env:USERPROFILE\Desktop" -ItemType Directory -Force | Out-Null
+          New-Item -Path "$env:USERPROFILE\Desktop\STOP_SESSION" -ItemType File -Force | Out-Null
+      - name: Run Windows smoke session
+        shell: pwsh
+        env:
+          ENABLE_WSL: ${{ inputs.enable_wsl }}
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+          SESSION_PROFILE: developer
+        run: ./scripts/windows.ps1 run
+      - name: Verify Windows reserved hostname
+        shell: pwsh
+        run: |
+          $status = & 'C:\Program Files\Tailscale\tailscale.exe' status --json | ConvertFrom-Json
+          if ($status.Self.HostName -ne 'debug-session-smoke-windows') {
+            throw "Expected debug-session-smoke-windows, received $($status.Self.HostName)"
+          }
+      - name: Verify Windows Developer Profile
+        shell: pwsh
+        run: |
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+          Update-SessionEnvironment
+          Get-Command 7z.exe, code.cmd, codex.cmd, grok.cmd -ErrorAction Stop
+          if ('${{ inputs.enable_wsl }}' -eq 'true') {
+            if ((wsl.exe --distribution Ubuntu --exec id -un).Trim() -ne 'runneradmin') {
+              throw 'The WSL Environment user is not ready'
+            }
+          }
+      - name: Clean up Windows smoke session
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/windows.ps1 cleanup
+      - name: Verify Windows logout
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & 'C:\Program Files\Tailscale\tailscale.exe' status *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw 'Tailscale still reports an active session'
+          }

@@ -1,0 +1,12 @@
+# reserved	candidate	leftover
+debug-session-linux	debug-session-linux	1
+debug-session-linux	debug-session-linux-1	1
+debug-session-linux	debug-session-linux-12	1
+debug-session-linux	debug-session-linux-extra	0
+debug-session-linux	debug-session-linux-1a	0
+debug-session-linux	other-debug-session-linux	0
+debug-session-windows	debug-session-windows	1
+debug-session-windows	debug-session-windows-1	1
+debug-session-windows	debug-session-windows-extra	0
+debug-session-smoke-linux	debug-session-smoke-linux-3	1
+debug-session-smoke-linux	debug-session-smoke-linux3	0

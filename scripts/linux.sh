@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+    printf '[debug-session] %s\n' "$*"
+}
+
+warn() {
+    printf '::warning::%s\n' "$*"
+}
+
+require_env() {
+    local name="$1"
+    [[ -n "${!name:-}" ]] || {
+        printf 'Required environment variable %s is empty\n' "$name" >&2
+        return 1
+    }
+}
+
+validate_session_password() {
+    require_env SESSION_PASSWORD
+    (( ${#SESSION_PASSWORD} >= 8 )) || {
+        printf 'SESSION_PASSWORD must contain at least 8 characters\n' >&2
+        return 1
+    }
+    [[ "$SESSION_PASSWORD" != *$'\n'* && "$SESSION_PASSWORD" != *$'\r'* ]] || {
+        printf 'SESSION_PASSWORD must be a single line\n' >&2
+        return 1
+    }
+}
+
+validate_inputs() {
+    require_env ACCESS_PROFILE
+    require_env SESSION_PROFILE
+    require_env SESSION_DEADLINE_EPOCH
+
+    case "$ACCESS_PROFILE" in
+        mini|full) ;;
+        *)
+            printf 'ACCESS_PROFILE must be mini or full\n' >&2
+            return 1
+            ;;
+    esac
+
+    case "$SESSION_PROFILE" in
+        core|developer) ;;
+        *)
+            printf 'SESSION_PROFILE must be core or developer\n' >&2
+            return 1
+            ;;
+    esac
+
+    [[ "$SESSION_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || {
+        printf 'SESSION_DEADLINE_EPOCH must be a Unix timestamp\n' >&2
+        return 1
+    }
+    (( SESSION_DEADLINE_EPOCH > $(date +%s) )) || {
+        printf 'SESSION_DEADLINE_EPOCH must be in the future\n' >&2
+        return 1
+    }
+
+    validate_session_password
+}
+
+apt_prerequisites_present() {
+    command -v curl >/dev/null 2>&1 &&
+        command -v gpg >/dev/null 2>&1 &&
+        [[ -f /etc/ssl/certs/ca-certificates.crt ]]
+}
+
+ensure_apt_prerequisites() {
+    if apt_prerequisites_present; then
+        return 0
+    fi
+
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+}
+
+configure_tailscale_repository() {
+    local codename
+    codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /etc/os-release)"
+    [[ -n "$codename" ]] || {
+        printf 'The Ubuntu release codename is unavailable\n' >&2
+        return 1
+    }
+
+    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" |
+        sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list" |
+        sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+}
+
+core_package_present() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_core_packages() {
+    local need_sshd=0
+    local need_tailscale=0
+    core_package_present sshd || need_sshd=1
+    core_package_present tailscale || need_tailscale=1
+
+    if (( need_sshd == 0 && need_tailscale == 0 )); then
+        return 0
+    fi
+
+    if (( need_tailscale )); then
+        configure_tailscale_repository
+    fi
+    sudo apt-get update
+    local -a packages=()
+    (( need_sshd )) && packages+=(openssh-server)
+    (( need_tailscale )) && packages+=(tailscale)
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+}
+
+configure_vscode_repository() {
+    curl -fsSL 'https://packages.microsoft.com/keys/microsoft.asc' |
+        sudo gpg --dearmor --yes -o /usr/share/keyrings/packages.microsoft.gpg
+    printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' |
+        sudo tee /etc/apt/sources.list.d/vscode.list >/dev/null
+}
+
+assert_private_listener() {
+    local port="$1"
+    local expected_ip="$2"
+    local listeners
+    listeners="$(sudo ss -H -ltn "sport = :$port" | awk '{print $4}')"
+    [[ -n "$listeners" ]] || {
+        printf 'No listener reached the ready state on TCP port %s\n' "$port" >&2
+        return 1
+    }
+
+    local listener
+    while IFS= read -r listener; do
+        case "$listener" in
+            "$expected_ip:$port"|"[$expected_ip]:$port") ;;
+            *)
+                printf 'TCP port %s is listening outside the Tailscale address: %s\n' "$port" "$listener" >&2
+                return 1
+                ;;
+        esac
+    done <<< "$listeners"
+}
+
+require_oauth_session_inputs() {
+    require_env TAILSCALE_OAUTH_CLIENT_ID
+    require_env TAILSCALE_OAUTH_CLIENT_SECRET
+    require_env TAILSCALE_HOSTNAME
+    require_env TAILSCALE_TAGS
+
+    local tag
+    local IFS=','
+    for tag in $TAILSCALE_TAGS; do
+        [[ "$tag" =~ ^tag:[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || {
+            printf 'TAILSCALE_TAGS must be a comma-separated list of Tailscale tags such as tag:debug-session\n' >&2
+            return 1
+        }
+    done
+}
+
+request_oauth_access_token() {
+    local response
+    response="$(curl -fsS --connect-timeout 30 \
+        -d "client_id=${TAILSCALE_OAUTH_CLIENT_ID}" \
+        -d "client_secret=${TAILSCALE_OAUTH_CLIENT_SECRET}" \
+        -d 'scope=devices:core' \
+        'https://api.tailscale.com/api/v2/oauth/token')" || {
+        printf 'Could not exchange the Tailscale OAuth client for an access token\n' >&2
+        return 1
+    }
+
+    python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+token = payload.get("access_token") or ""
+if not token:
+    sys.exit(1)
+print(token)
+' <<<"$response" || {
+        printf 'The Tailscale OAuth token response did not include an access token\n' >&2
+        return 1
+    }
+}
+
+list_reserved_hostname_leftovers() {
+    local reserved="$1"
+    local exclude="${2:-}"
+    python3 -c '
+import json, re, sys
+
+reserved = sys.argv[1]
+exclude = sys.argv[2]
+payload = json.load(sys.stdin)
+devices = payload.get("devices") or []
+pattern = re.compile("^" + re.escape(reserved) + r"(?:-\d+)?$")
+for device in devices:
+    if not isinstance(device, dict):
+        continue
+    name = device.get("hostname") or ""
+    if not pattern.fullmatch(name):
+        continue
+    node_id = device.get("nodeId") or device.get("id")
+    if node_id is None or node_id == "":
+        continue
+    node_id = str(node_id)
+    identifiers = {
+        str(device.get("nodeId") or ""),
+        str(device.get("id") or ""),
+        node_id,
+    }
+    if exclude and exclude in identifiers:
+        continue
+    print(f"{node_id}\t{name}")
+' "$reserved" "$exclude"
+}
+
+delete_tailscale_device() {
+    local access_token="$1"
+    local device_id="$2"
+    local device_name="$3"
+    local status
+    status="$(curl -sS --connect-timeout 30 -o /dev/null -w '%{http_code}' \
+        -X DELETE \
+        -H "Authorization: Bearer ${access_token}" \
+        "https://api.tailscale.com/api/v2/device/${device_id}")" || {
+        printf 'Could not delete leftover Tailscale device %s\n' "$device_name" >&2
+        return 1
+    }
+    case "$status" in
+        200|204|404)
+            log "Removed leftover Tailscale device ${device_name}"
+            ;;
+        *)
+            printf 'Could not delete leftover Tailscale device %s (HTTP %s)\n' "$device_name" "$status" >&2
+            return 1
+            ;;
+    esac
+}
+
+reclaim_reserved_hostname() {
+    local access_token="$1"
+    local exclude="${2:-}"
+    local payload device_id device_name
+    payload="$(curl -fsS --connect-timeout 30 \
+        -H "Authorization: Bearer ${access_token}" \
+        'https://api.tailscale.com/api/v2/tailnet/-/devices')" || {
+        printf 'Could not list Tailscale devices\n' >&2
+        return 1
+    }
+
+    while IFS=$'\t' read -r device_id device_name; do
+        [[ -n "$device_id" ]] || continue
+        delete_tailscale_device "$access_token" "$device_id" "$device_name"
+    done < <(list_reserved_hostname_leftovers "$TAILSCALE_HOSTNAME" "$exclude" <<<"$payload")
+}
+
+read_self_tailscale_identity() {
+    python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+self_status = payload.get("Self") or {}
+hostname = self_status.get("HostName") or ""
+node_id = self_status.get("ID") or ""
+if not hostname or not node_id:
+    sys.exit(1)
+print(f"{hostname}\t{node_id}")
+'
+}
+
+join_private_network() {
+    local access_token="$1"
+    local auth_key="${TAILSCALE_OAUTH_CLIENT_SECRET}?ephemeral=true&preauthorized=true"
+    sudo tailscale up --auth-key "$auth_key" \
+        --advertise-tags "$TAILSCALE_TAGS" \
+        --hostname "$TAILSCALE_HOSTNAME"
+
+    local identity current_hostname self_id
+    identity="$(read_self_tailscale_identity < <(tailscale status --json))" || {
+        printf 'Tailscale did not report this node identity\n' >&2
+        return 1
+    }
+    IFS=$'\t' read -r current_hostname self_id <<<"$identity"
+
+    if [[ "$current_hostname" != "$TAILSCALE_HOSTNAME" ]]; then
+        reclaim_reserved_hostname "$access_token" "$self_id"
+        sudo tailscale set --hostname "$TAILSCALE_HOSTNAME"
+        identity="$(read_self_tailscale_identity < <(tailscale status --json))" || {
+            printf 'Tailscale did not report this node identity\n' >&2
+            return 1
+        }
+        IFS=$'\t' read -r current_hostname self_id <<<"$identity"
+    fi
+
+    if [[ "$current_hostname" != "$TAILSCALE_HOSTNAME" ]]; then
+        printf 'Could not claim reserved Tailscale name %s; this node is %s\n' \
+            "$TAILSCALE_HOSTNAME" "$current_hostname" >&2
+        return 1
+    fi
+
+    reclaim_reserved_hostname "$access_token" "$self_id"
+}
+
+enable_core_session() {
+    validate_inputs
+    require_oauth_session_inputs
+
+    ensure_apt_prerequisites
+    local access_token
+    access_token="$(request_oauth_access_token)"
+    reclaim_reserved_hostname "$access_token"
+
+    sudo systemctl stop ssh 2>/dev/null || true
+    sudo systemctl mask --runtime ssh.service ssh.socket >/dev/null
+    ensure_core_packages
+
+    sudo systemctl enable --now tailscaled
+    join_private_network "$access_token"
+
+    local tailscale_ip
+    tailscale_ip="$(tailscale ip -4)"
+    [[ -n "$tailscale_ip" ]] || {
+        printf 'Tailscale did not assign an IPv4 address\n' >&2
+        return 1
+    }
+
+    local session_user
+    session_user="$(id -un)"
+    printf '%s:%s\n' "$session_user" "$SESSION_PASSWORD" | sudo chpasswd
+    printf 'PasswordAuthentication yes\nPermitRootLogin no\nListenAddress %s\n' "$tailscale_ip" |
+        sudo tee /etc/ssh/sshd_config.d/00-debug-session.conf >/dev/null
+    sudo install -d -o root -g root -m 0755 /run/sshd
+    sudo sshd -t
+    sudo systemctl unmask --runtime ssh.service ssh.socket >/dev/null
+    sudo systemctl enable --now ssh
+    sudo systemctl restart ssh
+
+    sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+    sudo systemctl is-active --quiet tailscaled
+    sudo systemctl is-active --quiet ssh
+    assert_private_listener 22 "$tailscale_ip"
+
+    local stop_session
+    stop_session="$(mktemp)"
+    cat > "$stop_session" <<'EOF'
+#!/bin/sh
+set -eu
+touch "$HOME/STOP_SESSION"
+EOF
+    sudo install -m 0755 "$stop_session" /usr/local/bin/stop-session
+    rm -f -- "$stop_session"
+
+    log "Linux $ACCESS_PROFILE Core Session ready; Developer Profile provisioning may continue"
+    printf 'SSH: %s@%s\n' "$session_user" "$tailscale_ip"
+    printf 'Stop Signal: run stop-session\n'
+}
+
+enable_xfce_rdp() {
+    local tailscale_ip
+    tailscale_ip="$(tailscale ip -4)" || true
+    if [[ -z "$tailscale_ip" ]]; then
+        warn 'Linux RDP Access Channel is unavailable; Tailscale did not assign an IPv4 address'
+        return 1
+    fi
+
+    sudo systemctl stop xrdp 2>/dev/null || true
+    sudo systemctl mask --runtime xrdp.service >/dev/null || true
+    if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dbus-x11 xorg xfce4 xrdp; then
+        warn 'Linux RDP Access Channel failed to install; SSH remains available'
+        return 1
+    fi
+
+    if ! printf '%s\n' 'startxfce4' > "$HOME/.xsession" ||
+        ! sudo adduser xrdp ssl-cert ||
+        ! sudo sed -i "0,/^port=.*/s|^port=.*|port=tcp://${tailscale_ip}:3389|" /etc/xrdp/xrdp.ini ||
+        ! sudo systemctl unmask --runtime xrdp.service >/dev/null ||
+        ! sudo systemctl enable --now xrdp ||
+        ! sudo systemctl restart xrdp ||
+        ! sudo systemctl is-active --quiet xrdp ||
+        ! assert_private_listener 3389 "$tailscale_ip"; then
+        warn 'Linux RDP Access Channel did not become ready; SSH remains available'
+        return 1
+    fi
+
+    log 'Linux full Access Channel ready'
+    printf 'RDP: %s:3389\n' "$tailscale_ip"
+}
+
+install_oh_my_zsh() {
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git zsh || return
+
+    umask 022
+    local install_dir="$HOME/.oh-my-zsh"
+    if [[ ! -d "$install_dir" ]]; then
+        local staging_dir
+        staging_dir="$(mktemp -d)" || return
+        if ! git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$staging_dir/oh-my-zsh"; then
+            rm -rf -- "$staging_dir"
+            return 1
+        fi
+        if ! mv "$staging_dir/oh-my-zsh" "$install_dir"; then
+            rm -rf -- "$staging_dir"
+            return 1
+        fi
+        rmdir "$staging_dir"
+    fi
+    chmod -R go-w "$install_dir" || return
+
+    if [[ ! -f "$HOME/.zshrc" ]]; then
+        cp "$install_dir/templates/zshrc.zsh-template" "$HOME/.zshrc" || return
+    elif ! grep -Fq 'oh-my-zsh.sh' "$HOME/.zshrc"; then
+        cp "$HOME/.zshrc" "$HOME/.zshrc.pre-oh-my-zsh" || return
+        cp "$install_dir/templates/zshrc.zsh-template" "$HOME/.zshrc" || return
+    fi
+    if ! grep -Fq 'ZSH_DISABLE_COMPFIX' "$HOME/.zshrc"; then
+        printf '%s\n' 'ZSH_DISABLE_COMPFIX=true' | cat - "$HOME/.zshrc" >"$HOME/.zshrc.debug-session" || return
+        mv "$HOME/.zshrc.debug-session" "$HOME/.zshrc" || return
+    fi
+
+    local zsh_path
+    zsh_path="$(command -v zsh)" || return
+    sudo chsh -s "$zsh_path" "$(id -un)"
+}
+
+install_developer_profile() {
+    local -a failed=()
+
+    if ! command -v code >/dev/null 2>&1; then
+        if configure_vscode_repository && sudo apt-get update &&
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y code; then
+            :
+        else
+            failed+=(vscode)
+        fi
+    fi
+
+    if ! command -v npm >/dev/null 2>&1; then
+        if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; then
+            failed+=(codex grok)
+        fi
+    fi
+
+    if command -v npm >/dev/null 2>&1; then
+        if ! command -v codex >/dev/null 2>&1 && ! npm install --global @openai/codex; then
+            failed+=(codex)
+        fi
+        if ! command -v grok >/dev/null 2>&1 && ! npm install --global @xai-official/grok; then
+            failed+=(grok)
+        fi
+    fi
+
+    if ! install_oh_my_zsh; then
+        failed+=(ohmyzsh)
+    fi
+
+    if (( ${#failed[@]} > 0 )); then
+        warn "Developer Profile is incomplete; failed tools: ${failed[*]}"
+    else
+        log 'Linux Developer Profile complete'
+    fi
+}
+
+wait_for_stop() {
+    local stop_file="$HOME/STOP_SESSION"
+    local tailscale_ip
+    tailscale_ip="$(tailscale ip -4)"
+
+    printf 'SSH: %s@%s\n' "$(id -un)" "$tailscale_ip"
+    if [[ "$ACCESS_PROFILE" == full ]] && sudo systemctl is-active --quiet xrdp; then
+        printf 'RDP: %s:3389\n' "$tailscale_ip"
+    fi
+    printf 'Stop Signal: run stop-session\n'
+    log 'Debug Session provisioning finished; waiting for the Stop Signal or Session Deadline'
+
+    while (( $(date +%s) < SESSION_DEADLINE_EPOCH )); do
+        if [[ -e "$stop_file" ]]; then
+            log 'Stop Signal received'
+            return 0
+        fi
+        sleep 15
+    done
+    log 'Session Deadline reached'
+}
+
+run_session() {
+    enable_core_session
+    if [[ "$ACCESS_PROFILE" == full ]]; then
+        enable_xfce_rdp || true
+    fi
+    if [[ "$SESSION_PROFILE" == developer ]]; then
+        install_developer_profile
+    fi
+    wait_for_stop
+}
+
+oauth_cleanup_configured() {
+    [[ -n "${TAILSCALE_OAUTH_CLIENT_ID:-}" &&
+        -n "${TAILSCALE_OAUTH_CLIENT_SECRET:-}" &&
+        -n "${TAILSCALE_HOSTNAME:-}" ]]
+}
+
+cleanup() {
+    local logout_status=0
+    if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+        sudo tailscale logout || logout_status=1
+    fi
+
+    if oauth_cleanup_configured; then
+        local access_token
+        access_token="$(request_oauth_access_token)" || {
+            printf 'Could not delete the reserved Tailscale device\n' >&2
+            return 1
+        }
+        reclaim_reserved_hostname "$access_token" || {
+            printf 'Could not delete the reserved Tailscale device\n' >&2
+            return 1
+        }
+    fi
+
+    if (( logout_status != 0 )); then
+        printf 'Tailscale logout failed; the reserved name is removed when device delete succeeds\n' >&2
+        return 1
+    fi
+}
+
+case "${1:-}" in
+    validate) validate_inputs ;;
+    run) run_session ;;
+    cleanup) cleanup ;;
+    *)
+        printf 'Usage: %s {validate|run|cleanup}\n' "$0" >&2
+        exit 2
+        ;;
+esac

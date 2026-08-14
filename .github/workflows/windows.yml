@@ -1,0 +1,56 @@
+name: Debug Session - Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_profile:
+        description: Session profile
+        type: choice
+        options:
+          - core
+          - developer
+        default: core
+        required: true
+      enable_wsl:
+        description: Initialize Ubuntu on WSL
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-session-windows
+  cancel-in-progress: false
+
+jobs:
+  debug-session:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      TAILSCALE_HOSTNAME: debug-session-windows
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+      TAILSCALE_TAGS: tag:debug-session
+    steps:
+      - name: Set Debug Session deadline
+        shell: pwsh
+        run: |
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + (330 * 60)
+          "SESSION_DEADLINE_EPOCH=$deadline" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check out session scripts
+        uses: actions/checkout@v6
+
+      - name: Run Windows Debug Session
+        shell: pwsh
+        env:
+          ENABLE_WSL: ${{ inputs.enable_wsl }}
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+          SESSION_PROFILE: ${{ inputs.session_profile }}
+        run: ./scripts/windows.ps1 run
+
+      - name: Clean up Windows Debug Session
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/windows.ps1 cleanup

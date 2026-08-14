@@ -1,0 +1,55 @@
+name: Debug Session - Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      access_profile:
+        description: Access profile
+        type: choice
+        options:
+          - mini
+          - full
+        default: mini
+        required: true
+      session_profile:
+        description: Session profile
+        type: choice
+        options:
+          - core
+          - developer
+        default: core
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-session-linux
+  cancel-in-progress: false
+
+jobs:
+  debug-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TAILSCALE_HOSTNAME: debug-session-linux
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+      TAILSCALE_TAGS: tag:debug-session
+    steps:
+      - name: Set Debug Session deadline
+        run: echo "SESSION_DEADLINE_EPOCH=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
+
+      - name: Check out session scripts
+        uses: actions/checkout@v6
+
+      - name: Run Linux Debug Session
+        env:
+          ACCESS_PROFILE: ${{ inputs.access_profile }}
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+          SESSION_PROFILE: ${{ inputs.session_profile }}
+        run: bash scripts/linux.sh run
+
+      - name: Clean up Linux Debug Session
+        if: ${{ always() }}
+        run: bash scripts/linux.sh cleanup
