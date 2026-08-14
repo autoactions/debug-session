@@ -427,7 +427,7 @@ function Install-StopSessionCommand {
     $commandPath = Join-Path $commandDir 'stop-session.cmd'
     @(
         '@echo off'
-        'copy /y nul "%USERPROFILE%\Desktop\STOP_SESSION" >nul'
+        'copy /y nul "%USERPROFILE%\STOP_SESSION" >nul'
     ) | Set-Content -LiteralPath $commandPath -Encoding ascii
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -586,7 +586,7 @@ printf '[user]\ndefault=runneradmin\n' > /etc/wsl.conf
 function Wait-DebugSession {
     param([Parameter(Mandatory = $true)][long]$DeadlineEpoch)
 
-    $stopFile = "$env:USERPROFILE\Desktop\STOP_SESSION"
+    $stopFile = "$env:USERPROFILE\STOP_SESSION"
     $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
     $tailscaleIp = (& $tailscale ip -4 | Select-Object -First 1).Trim()
     $deadline = [DateTimeOffset]::FromUnixTimeSeconds($DeadlineEpoch).UtcDateTime

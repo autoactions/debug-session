@@ -112,5 +112,8 @@ if ($windowsScript -notmatch 'stop-session\.lnk') {
 if ($windowsScript -match 'STOP_SESSION_HERE') {
     throw 'Windows still writes the STOP_SESSION_HERE instruction file'
 }
+if ($windowsScript -match 'Desktop\\STOP_SESSION') {
+    throw 'Windows still writes the STOP_SESSION file to the desktop'
+}
 
 Write-Output 'Windows input behavior: PASS'
