@@ -18,10 +18,10 @@ codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /
 
 check_url 'Tailscale Ubuntu signing key' "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg"
 check_url 'Tailscale Ubuntu repository' "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list"
-check_url 'Tailscale Chocolatey package' 'https://community.chocolatey.org/packages/tailscale'
-check_url '7-Zip Chocolatey package' 'https://community.chocolatey.org/packages/7zip'
-check_url 'VS Code Chocolatey package' 'https://community.chocolatey.org/packages/vscode'
+check_url 'Tailscale Windows stable index' 'https://pkgs.tailscale.com/stable/?mode=json'
 check_url 'VS Code apt repository' 'https://packages.microsoft.com/repos/code/dists/stable/Release'
+check_url 'VS Code Windows release index' 'https://update.code.visualstudio.com/api/releases/stable'
+check_url 'Node.js distribution index' 'https://nodejs.org/dist/index.json'
 
 npm view '@openai/codex' version >/dev/null
 npm view '@xai-official/grok' version >/dev/null

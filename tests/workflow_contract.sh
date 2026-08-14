@@ -75,6 +75,7 @@ assert_contains "$smoke_workflow" 'bash scripts/linux.sh run'
 assert_contains "$smoke_workflow" './scripts/windows.ps1 run'
 assert_contains "$smoke_workflow" 'debug-session-smoke-linux'
 assert_contains "$smoke_workflow" 'debug-session-smoke-windows'
+assert_not_contains "$smoke_workflow" 'ChocolateyInstall'
 
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
     # shellcheck disable=SC2016

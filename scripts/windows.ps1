@@ -57,17 +57,19 @@ function Get-ValidatedSessionInput {
     }
 }
 
-function Invoke-ChocolateyInstall {
-    param([Parameter(Mandatory = $true)][string[]]$Packages)
-
-    choco install @Packages -y --no-progress | Out-Host
-    $succeeded = $LASTEXITCODE -in @(0, 1641, 3010)
-    $profileModule = Join-Path $env:ChocolateyInstall 'helpers\chocolateyProfile.psm1'
-    if ($succeeded -and (Test-Path -LiteralPath $profileModule)) {
-        Import-Module $profileModule
-        Update-SessionEnvironment
+function Get-WindowsNativeArch {
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        'AMD64' { return 'amd64' }
+        'ARM64' { return 'arm64' }
+        'x86' { return 'x86' }
+        default { throw "Unsupported Windows architecture: $($env:PROCESSOR_ARCHITECTURE)" }
     }
-    return $succeeded
+}
+
+function Sync-ProcessPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = "$machine;$user"
 }
 
 function Initialize-PrivateFirewallRule {
@@ -253,8 +255,44 @@ function Get-TailscaleCommand {
 }
 
 function Install-TailscalePackage {
-    if (-not (Invoke-ChocolateyInstall -Packages @('tailscale'))) {
-        throw 'The latest stable Tailscale installation failed'
+    $arch = Get-WindowsNativeArch
+
+    try {
+        $index = Invoke-RestMethod -Uri 'https://pkgs.tailscale.com/stable/?mode=json'
+    } catch {
+        throw 'Could not resolve the latest stable Tailscale Windows installer'
+    }
+    $packageName = [string]$index.MSIs.$arch
+    if ([string]::IsNullOrWhiteSpace($packageName)) {
+        throw "Tailscale did not publish a stable Windows installer for $arch"
+    }
+
+    $packageUrl = "https://pkgs.tailscale.com/stable/$packageName"
+    $installer = Join-Path $env:TEMP $packageName
+    try {
+        try {
+            Invoke-WebRequest -Uri $packageUrl -OutFile $installer -UseBasicParsing
+        } catch {
+            throw 'Could not download the latest stable Tailscale Windows installer'
+        }
+        try {
+            $expected = ([string](Invoke-RestMethod -Uri "$packageUrl.sha256")).Trim()
+        } catch {
+            throw 'Could not download the Tailscale installer checksum'
+        }
+        $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+        if ([string]::IsNullOrWhiteSpace($expected) -or $actual -ne $expected) {
+            throw 'The Tailscale installer checksum did not match'
+        }
+
+        $process = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', $installer, '/qn', '/norestart', 'TS_NOLAUNCH=1'
+        )
+        if ($process.ExitCode -notin @(0, 1641, 3010)) {
+            throw 'The latest stable Tailscale installation failed'
+        }
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -470,10 +508,10 @@ function Enter-CoreSession {
     if (-not $reusedPreinstalled) {
         Install-TailscalePackage
     }
-    & $tailscale up --auth-key $authKey --advertise-tags $tags --hostname $hostname
+    & $tailscale up --unattended --auth-key $authKey --advertise-tags $tags --hostname $hostname
     if ($LASTEXITCODE -ne 0 -and $reusedPreinstalled) {
         Install-TailscalePackage
-        & $tailscale up --auth-key $authKey --advertise-tags $tags --hostname $hostname
+        & $tailscale up --unattended --auth-key $authKey --advertise-tags $tags --hostname $hostname
     }
     if ($LASTEXITCODE -ne 0) {
         throw 'Tailscale failed to join the private network'
@@ -492,22 +530,89 @@ function Enter-CoreSession {
     Write-Output 'Stop Signal: run stop-session'
 }
 
+function Install-VSCodePackage {
+    try {
+        $os = switch (Get-WindowsNativeArch) {
+            'amd64' { 'win32-x64' }
+            'arm64' { 'win32-arm64' }
+            'x86' { 'win32' }
+        }
+        $installer = Join-Path $env:TEMP "vscode-setup-$os.exe"
+        try {
+            Invoke-WebRequest -Uri "https://update.code.visualstudio.com/latest/$os/stable" `
+                -OutFile $installer -UseBasicParsing
+            $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+                '/verysilent', '/norestart', '/mergetasks=!runcode'
+            )
+            if ($process.ExitCode -notin @(0, 1641, 3010)) {
+                return $false
+            }
+        } finally {
+            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        }
+        Sync-ProcessPath
+        return [bool](Get-Command code.cmd -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
+function Install-NodeJsPackage {
+    try {
+        $msiArch = switch (Get-WindowsNativeArch) {
+            'amd64' { 'x64' }
+            'arm64' { 'arm64' }
+            'x86' { 'x86' }
+        }
+        $releases = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json'
+        $lts = $releases | Where-Object { $_.lts } | Select-Object -First 1
+        if (-not $lts) {
+            return $false
+        }
+        $version = [string]$lts.version
+        $packageName = "node-$version-$msiArch.msi"
+        $packageUrl = "https://nodejs.org/dist/$version/$packageName"
+        $installer = Join-Path $env:TEMP $packageName
+        try {
+            Invoke-WebRequest -Uri $packageUrl -OutFile $installer -UseBasicParsing
+            $sums = [string](Invoke-RestMethod -Uri "https://nodejs.org/dist/$version/SHASUMS256.txt")
+            $expected = (
+                $sums -split '\r?\n' |
+                    Where-Object { $_ -match [regex]::Escape($packageName) } |
+                    ForEach-Object { ($_ -split '\s+')[0] } |
+                    Select-Object -First 1
+            )
+            $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+            if ([string]::IsNullOrWhiteSpace($expected) -or $actual -ne $expected) {
+                return $false
+            }
+            $process = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
+                '/i', $installer, '/qn', '/norestart'
+            )
+            if ($process.ExitCode -notin @(0, 1641, 3010)) {
+                return $false
+            }
+        } finally {
+            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        }
+        Sync-ProcessPath
+        return [bool](Get-Command npm.cmd -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 function Install-DeveloperProfile {
     $failed = [System.Collections.Generic.List[string]]::new()
 
-    if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
-        if (-not (Invoke-ChocolateyInstall -Packages @('7zip'))) {
-            $failed.Add('7zip')
-        }
-    }
     if (-not (Get-Command code.cmd -ErrorAction SilentlyContinue)) {
-        if (-not (Invoke-ChocolateyInstall -Packages @('vscode'))) {
+        if (-not (Install-VSCodePackage)) {
             $failed.Add('vscode')
         }
     }
 
     if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
-        if (-not (Invoke-ChocolateyInstall -Packages @('nodejs'))) {
+        if (-not (Install-NodeJsPackage)) {
             $failed.Add('codex')
             $failed.Add('grok')
         }

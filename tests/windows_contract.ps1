@@ -100,9 +100,27 @@ try {
     if ($message -like '*choco *' -or $message -like '*Chocolatey*') {
         throw 'Windows run reached Chocolatey before the OAuth client check'
     }
+    if ($message -like '*pkgs.tailscale.com*' -or $message -like '*msiexec*') {
+        throw 'Windows run reached Tailscale install before the OAuth client check'
+    }
 }
 
 $windowsScript = Get-Content -LiteralPath $scriptPath -Raw
+if ($windowsScript -match 'choco install' -or $windowsScript -match 'Invoke-ChocolateyInstall') {
+    throw 'Windows still installs software with Chocolatey'
+}
+if ($windowsScript -notmatch 'https://pkgs\.tailscale\.com/stable/\?mode=json') {
+    throw 'Windows does not resolve Tailscale from the official stable packages'
+}
+if ($windowsScript -notmatch '--unattended') {
+    throw 'Windows does not bring Tailscale up in unattended mode'
+}
+if ($windowsScript -notmatch 'update\.code\.visualstudio\.com/latest/') {
+    throw 'Windows does not install VS Code from the official Microsoft installer'
+}
+if ($windowsScript -notmatch 'nodejs\.org/dist/index\.json') {
+    throw 'Windows does not resolve Node.js from the official distribution index'
+}
 if ($windowsScript -notmatch 'stop-session\.cmd') {
     throw 'Windows does not install the stop-session command on PATH'
 }
