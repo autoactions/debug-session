@@ -711,9 +711,328 @@ function Wait-DebugSession {
     Write-Output '[debug-session] Session Deadline reached'
 }
 
+function Test-RcloneConfigPresent {
+    return -not [string]::IsNullOrWhiteSpace($env:RCLONE_CONFIG)
+}
+
+function Get-RcloneConfigPath {
+    return (Join-Path $env:APPDATA 'rclone\rclone.conf')
+}
+
+function Get-RcloneCloudRoot {
+    return (Join-Path $env:USERPROFILE 'cloud')
+}
+
+function Get-RcloneLogDirectory {
+    return (Join-Path $env:LOCALAPPDATA 'debug-session')
+}
+
+function Get-RcloneCommand {
+    $installed = Join-Path $env:LOCALAPPDATA 'debug-session\bin\rclone.exe'
+    if (Test-Path -LiteralPath $installed) {
+        return $installed
+    }
+    $existing = Get-Command rclone.exe -ErrorAction SilentlyContinue
+    if ($existing) {
+        return $existing.Source
+    }
+    return $installed
+}
+
+function Test-RcloneRemoteMountable {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq '.' -or $Name -eq '..') {
+        return $false
+    }
+    if ($Name.Contains('/') -or $Name.Contains('\')) {
+        return $false
+    }
+    foreach ($invalid in [IO.Path]::GetInvalidFileNameChars()) {
+        if ($Name.IndexOf($invalid) -ge 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Write-RcloneConfigFile {
+    $configPath = Get-RcloneConfigPath
+    $configDir = Split-Path -Parent $configPath
+    New-Item -Path $configDir -ItemType Directory -Force | Out-Null
+    Set-Content -LiteralPath $configPath -Value $env:RCLONE_CONFIG -Encoding utf8
+    $acl = Get-Acl -LiteralPath $configPath
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+        'FullControl',
+        'Allow'
+    )
+    $acl.SetAccessRule($rule)
+    try {
+        Set-Acl -LiteralPath $configPath -AclObject $acl
+    } catch {
+        Write-Warning "Could not restrict ACL on the rclone config file: $_"
+    }
+    # rclone treats RCLONE_CONFIG as a file path, not the file contents.
+    $env:RCLONE_CONFIG = $configPath
+}
+
+function Get-RcloneRemoteNames {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    $names = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        return $names
+    }
+
+    $current = $null
+    $hasType = $false
+    foreach ($raw in Get-Content -LiteralPath $ConfigPath) {
+        $line = $raw.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#') -or $line.StartsWith(';')) {
+            continue
+        }
+        if ($line.StartsWith('[') -and $line.EndsWith(']')) {
+            if ($current -and $hasType) {
+                $names.Add($current)
+            }
+            $current = $line.Substring(1, $line.Length - 2).Trim()
+            $hasType = $false
+            continue
+        }
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 0) {
+            continue
+        }
+        $key = $line.Substring(0, $separator).Trim().ToLowerInvariant()
+        if ($key -eq 'type') {
+            $hasType = $true
+        }
+    }
+    if ($current -and $hasType) {
+        $names.Add($current)
+    }
+    return $names
+}
+
+function Get-RcloneArchiveUrl {
+    $arch = Get-WindowsNativeArch
+    $suffix = switch ($arch) {
+        'amd64' { 'amd64' }
+        'arm64' { 'arm64' }
+        'x86' { '386' }
+        default { throw "Unsupported Windows architecture for rclone: $arch" }
+    }
+    return "https://downloads.rclone.org/rclone-current-windows-$suffix.zip"
+}
+
+function Install-RclonePackage {
+    $destination = Get-RcloneCommand
+    if (Test-Path -LiteralPath $destination) {
+        return
+    }
+    if (Get-Command rclone.exe -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $url = Get-RcloneArchiveUrl
+    $archive = Join-Path $env:TEMP 'rclone-current-windows.zip'
+    $staging = Join-Path $env:TEMP ("rclone-extract-" + [guid]::NewGuid().ToString('N'))
+    New-Item -Path $staging -ItemType Directory -Force | Out-Null
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force
+        $binary = Get-ChildItem -Path $staging -Filter rclone.exe -Recurse | Select-Object -First 1
+        if (-not $binary) {
+            throw 'The rclone archive did not contain rclone.exe'
+        }
+        $binDir = Split-Path -Parent $destination
+        New-Item -Path $binDir -ItemType Directory -Force | Out-Null
+        Copy-Item -LiteralPath $binary.FullName -Destination $destination -Force
+
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $pathEntries = @()
+        if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+            $pathEntries = $userPath.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries)
+        }
+        if ($pathEntries -notcontains $binDir) {
+            $updatedPath = if ($pathEntries.Count -eq 0) { $binDir } else { "$binDir;$userPath" }
+            [Environment]::SetEnvironmentVariable('Path', $updatedPath, 'User')
+        }
+        Sync-ProcessPath
+        if (($env:Path -split ';') -notcontains $binDir) {
+            $env:Path = "$binDir;$env:Path"
+        }
+    } finally {
+        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-WinFspInstalled {
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\WinFsp\bin\winfsp-x64.dll",
+        "$env:ProgramFiles\WinFsp\bin\winfsp-x64.dll",
+        "${env:ProgramFiles(x86)}\WinFsp\bin\winfsp-a64.dll",
+        "$env:ProgramFiles\WinFsp\bin\winfsp-a64.dll"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Install-WinFspPackage {
+    if (Test-WinFspInstalled) {
+        return
+    }
+
+    $headers = @{ 'User-Agent' = 'debug-session' }
+    try {
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/winfsp/winfsp/releases/latest' -Headers $headers
+    } catch {
+        throw 'Could not resolve the latest WinFsp release'
+    }
+    $asset = @(
+        $release.assets |
+            Where-Object { $_.name -like 'winfsp-*.msi' -and $_.name -notlike '*symbols*' }
+    ) | Select-Object -First 1
+    if (-not $asset) {
+        throw 'The latest WinFsp release did not publish an MSI installer'
+    }
+
+    $installer = Join-Path $env:TEMP $asset.name
+    try {
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing
+        $process = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', $installer, '/qn', '/norestart'
+        )
+        if ($process.ExitCode -notin @(0, 1641, 3010)) {
+            throw "WinFsp installation failed with exit code $($process.ExitCode)"
+        }
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Wait-RcloneMount {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) {
+            $item = Get-Item -LiteralPath $Path -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                return $true
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function ConvertTo-WslWindowsPath {
+    param([Parameter(Mandatory = $true)][string]$WindowsPath)
+
+    if ($WindowsPath -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $Matches[1].ToLowerInvariant()
+        $rest = $Matches[2].Replace('\', '/')
+        return "/mnt/$drive/$rest"
+    }
+    return $WindowsPath
+}
+
+function Mount-RcloneRemote {
+    param([Parameter(Mandatory = $true)][string]$Remote)
+
+    $dest = Join-Path (Get-RcloneCloudRoot) $Remote
+    New-Item -Path $dest -ItemType Directory -Force | Out-Null
+    $logDir = Get-RcloneLogDirectory
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    $logFile = Join-Path $logDir "rclone-$Remote.log"
+    $rclone = Get-RcloneCommand
+    $process = Start-Process -FilePath $rclone -PassThru -WindowStyle Hidden -ArgumentList @(
+        'mount', "${Remote}:", $dest,
+        '--config', (Get-RcloneConfigPath),
+        '--vfs-cache-mode', 'writes',
+        '--log-file', $logFile
+    )
+    if (-not (Wait-RcloneMount -Path $dest -TimeoutSeconds 60)) {
+        if ($process -and -not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+        throw "rclone mount did not become ready for $Remote"
+    }
+    $wslPath = ConvertTo-WslWindowsPath -WindowsPath $dest
+    Write-Output "[debug-session] rclone mount ready: $dest (WSL: $wslPath)"
+}
+
+function Enable-RcloneMounts {
+    if (-not (Test-RcloneConfigPresent)) {
+        return
+    }
+
+    try {
+        Write-RcloneConfigFile
+        Install-WinFspPackage
+        Install-RclonePackage
+        $remotes = @(Get-RcloneRemoteNames -ConfigPath (Get-RcloneConfigPath))
+        if ($remotes.Count -eq 0) {
+            Write-Warning 'rclone config did not contain any mountable remotes'
+            return
+        }
+        $mounted = 0
+        foreach ($remote in $remotes) {
+            if (-not (Test-RcloneRemoteMountable -Name $remote)) {
+                Write-Warning "Skipping rclone remote with an unsafe name: $remote"
+                continue
+            }
+            try {
+                Mount-RcloneRemote -Remote $remote
+                $mounted += 1
+            } catch {
+                Write-Warning "rclone mount failed for ${remote}: $_"
+            }
+        }
+        if ($mounted -eq 0) {
+            Write-Warning 'rclone cloud mounts are unavailable; the Core Session remains available'
+        }
+    } catch {
+        Write-Warning "rclone cloud mounts are unavailable; the Core Session remains available: $_"
+    }
+}
+
+function Close-RcloneMounts {
+    Get-Process -Name rclone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+
+    $configPath = Get-RcloneConfigPath
+    if (Test-Path -LiteralPath $configPath) {
+        Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($cache in @(
+            (Join-Path $env:LOCALAPPDATA 'rclone'),
+            (Join-Path $env:USERPROFILE '.cache\rclone')
+        )) {
+        if (Test-Path -LiteralPath $cache) {
+            Remove-Item -LiteralPath $cache -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $logDir = Get-RcloneLogDirectory
+    Get-ChildItem -Path $logDir -Filter 'rclone-*.log' -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 function Enter-DebugSession {
     $inputs = Get-ValidatedSessionInput
     Enter-CoreSession
+    Enable-RcloneMounts
     if ($inputs.SessionProfile -eq 'developer') {
         Install-DeveloperProfile
     }
@@ -741,6 +1060,12 @@ function Test-OAuthCleanupConfigured {
 }
 
 function Close-DebugSession {
+    try {
+        Close-RcloneMounts
+    } catch {
+        Write-Warning "rclone cleanup failed; continuing Tailscale cleanup: $_"
+    }
+
     $logoutFailed = $false
     $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
     if (Test-Path -LiteralPath $tailscale) {

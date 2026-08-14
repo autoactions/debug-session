@@ -486,8 +486,209 @@ wait_for_stop() {
     log 'Session Deadline reached'
 }
 
+rclone_config_present() {
+    [[ -n "${RCLONE_CONFIG:-}" ]]
+}
+
+rclone_config_path() {
+    printf '%s/.config/rclone/rclone.conf' "$HOME"
+}
+
+rclone_cloud_root() {
+    printf '%s/cloud' "$HOME"
+}
+
+rclone_log_dir() {
+    printf '%s/.cache/debug-session' "$HOME"
+}
+
+rclone_remote_mountable() {
+    local name="$1"
+    [[ -n "$name" && "$name" != '.' && "$name" != '..' ]] || return 1
+    [[ "$name" != */* && "$name" != *\\* ]] || return 1
+    return 0
+}
+
+write_rclone_config() {
+    local config_dir config_path
+    config_path="$(rclone_config_path)"
+    config_dir="$(dirname "$config_path")"
+    mkdir -p "$config_dir"
+    chmod 700 "$config_dir"
+    umask 077
+    printf '%s\n' "$RCLONE_CONFIG" >"$config_path"
+    chmod 600 "$config_path"
+    # rclone treats RCLONE_CONFIG as a file path, not the file contents.
+    export RCLONE_CONFIG="$config_path"
+}
+
+list_rclone_remotes_from_config() {
+    python3 -c '
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+except OSError:
+    sys.exit(1)
+
+current = None
+has_type = False
+
+def flush():
+    if current and has_type:
+        print(current)
+
+for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith("#") or line.startswith(";"):
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        flush()
+        current = line[1:-1].strip()
+        has_type = False
+        continue
+    key = line.split("=", 1)[0].strip().lower()
+    if key == "type":
+        has_type = True
+flush()
+' "$(rclone_config_path)"
+}
+
+linux_rclone_archive_url() {
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            printf '%s\n' 'https://downloads.rclone.org/rclone-current-linux-amd64.zip'
+            ;;
+        aarch64 | arm64)
+            printf '%s\n' 'https://downloads.rclone.org/rclone-current-linux-arm64.zip'
+            ;;
+        *)
+            printf 'Unsupported Linux architecture for rclone: %s\n' "$(uname -m)" >&2
+            return 1
+            ;;
+    esac
+}
+
+ensure_rclone_and_fuse() {
+    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fuse3 unzip
+    elif ! command -v unzip >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y unzip
+    fi
+
+    if command -v rclone >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local url archive staging bin
+    url="$(linux_rclone_archive_url)" || return 1
+    archive="$(mktemp)"
+    staging="$(mktemp -d)"
+    if ! curl -fsSL "$url" -o "$archive"; then
+        rm -f -- "$archive"
+        rm -rf -- "$staging"
+        return 1
+    fi
+    if ! unzip -q "$archive" -d "$staging"; then
+        rm -f -- "$archive"
+        rm -rf -- "$staging"
+        return 1
+    fi
+    bin="$(find "$staging" -type f -name rclone -print -quit)"
+    if [[ -z "$bin" ]] || ! sudo install -m 0755 "$bin" /usr/local/bin/rclone; then
+        rm -f -- "$archive"
+        rm -rf -- "$staging"
+        return 1
+    fi
+    rm -f -- "$archive"
+    rm -rf -- "$staging"
+}
+
+mount_rclone_remote() {
+    local remote="$1"
+    local dest log_file
+    dest="$(rclone_cloud_root)/$remote"
+    log_file="$(rclone_log_dir)/rclone-${remote}.log"
+    mkdir -p "$dest" "$(rclone_log_dir)"
+    rclone mount "${remote}:" "$dest" \
+        --config "$(rclone_config_path)" \
+        --vfs-cache-mode writes \
+        --daemon \
+        --log-file "$log_file"
+}
+
+provision_rclone_mounts() {
+    write_rclone_config || return 1
+    ensure_rclone_and_fuse || return 1
+    mkdir -p "$(rclone_cloud_root)" "$(rclone_log_dir)"
+
+    local remote
+    local found=0
+    local mounted=0
+    while IFS= read -r remote; do
+        [[ -n "$remote" ]] || continue
+        found=1
+        if ! rclone_remote_mountable "$remote"; then
+            warn "Skipping rclone remote with an unsafe name: $remote"
+            continue
+        fi
+        if mount_rclone_remote "$remote"; then
+            mounted=1
+            log "rclone mount ready: $HOME/cloud/$remote"
+        else
+            warn "rclone mount failed for $remote"
+        fi
+    done < <(list_rclone_remotes_from_config)
+
+    if (( found == 0 )); then
+        warn 'rclone config did not contain any mountable remotes'
+        return 1
+    fi
+    if (( mounted == 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+enable_rclone_mounts() {
+    if ! rclone_config_present; then
+        return 0
+    fi
+    if ! provision_rclone_mounts; then
+        warn 'rclone cloud mounts are unavailable; the Core Session remains available'
+    fi
+    return 0
+}
+
+unmount_rclone_path() {
+    local dir="$1"
+    fusermount3 -u "$dir" 2>/dev/null ||
+        fusermount -u "$dir" 2>/dev/null ||
+        umount "$dir" 2>/dev/null ||
+        true
+}
+
+cleanup_rclone_mounts() {
+    local root dir
+    root="$(rclone_cloud_root)"
+    if [[ -d "$root" ]]; then
+        for dir in "$root"/*; do
+            [[ -e "$dir" || -L "$dir" ]] || continue
+            unmount_rclone_path "$dir"
+        done
+    fi
+    pkill -x rclone 2>/dev/null || true
+    rm -f -- "$(rclone_config_path)"
+    rm -rf -- "$HOME/.cache/rclone" "$(rclone_log_dir)"
+}
+
 run_session() {
     enable_core_session
+    enable_rclone_mounts
     if [[ "$ACCESS_PROFILE" == full ]]; then
         enable_xfce_rdp || true
     fi
@@ -504,6 +705,8 @@ oauth_cleanup_configured() {
 }
 
 cleanup() {
+    cleanup_rclone_mounts || warn 'rclone cleanup failed; continuing Tailscale cleanup'
+
     local logout_status=0
     if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
         sudo tailscale logout || logout_status=1
@@ -527,12 +730,14 @@ cleanup() {
     fi
 }
 
-case "${1:-}" in
-    validate) validate_inputs ;;
-    run) run_session ;;
-    cleanup) cleanup ;;
-    *)
-        printf 'Usage: %s {validate|run|cleanup}\n' "$0" >&2
-        exit 2
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        validate) validate_inputs ;;
+        run) run_session ;;
+        cleanup) cleanup ;;
+        *)
+            printf 'Usage: %s {validate|run|cleanup}\n' "$0" >&2
+            exit 2
+            ;;
+    esac
+fi

@@ -133,5 +133,40 @@ if ($windowsScript -match 'STOP_SESSION_HERE') {
 if ($windowsScript -match 'Desktop\\STOP_SESSION') {
     throw 'Windows still writes the STOP_SESSION file to the desktop'
 }
+if ($windowsScript -notmatch 'Enable-RcloneMounts') {
+    throw 'Windows does not provision rclone mounts'
+}
+if ($windowsScript -notmatch 'downloads\.rclone\.org/rclone-current-windows-') {
+    throw 'Windows does not install rclone from the official current package'
+}
+if ($windowsScript -notmatch 'api\.github\.com/repos/winfsp/winfsp/releases/latest') {
+    throw 'Windows does not resolve WinFsp from the official GitHub latest release'
+}
+if ($windowsScript -notmatch '--vfs-cache-mode'', ''writes') {
+    throw 'Windows does not use vfs-cache-mode writes'
+}
+if ($windowsScript -match '--allow-other') {
+    throw 'Windows enables FUSE allow-other'
+}
+if ($windowsScript -notmatch 'Close-RcloneMounts') {
+    throw 'Windows does not clean up rclone mounts'
+}
+
+$enableCore = $windowsScript.LastIndexOf('Enter-CoreSession')
+$enableRclone = $windowsScript.LastIndexOf('Enable-RcloneMounts')
+$enableDeveloper = $windowsScript.LastIndexOf('Install-DeveloperProfile')
+$enableWsl = $windowsScript.LastIndexOf('Initialize-WslUbuntu')
+if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableDeveloper -lt 0 -or $enableWsl -lt 0) {
+    throw 'Windows session startup is missing core, rclone, developer, or WSL steps'
+}
+if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableDeveloper -and $enableRclone -lt $enableWsl)) {
+    throw 'Windows does not mount rclone after Core Session ready and before Developer/WSL'
+}
+
+$closeRclone = $windowsScript.LastIndexOf('Close-RcloneMounts')
+$logout = $windowsScript.LastIndexOf('$tailscale logout')
+if ($closeRclone -lt 0 -or $logout -lt 0 -or $closeRclone -ge $logout) {
+    throw 'Windows does not clean up rclone mounts before Tailscale logout'
+}
 
 Write-Output 'Windows input behavior: PASS'

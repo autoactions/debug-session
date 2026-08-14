@@ -67,6 +67,7 @@ assert_not_contains "$windows_workflow" 'configure_desktop'
 assert_contains "$validation_workflow" 'bash tests/dependency_preflight.sh'
 assert_contains "$validation_workflow" 'bash tests/workflow_contract.sh'
 assert_contains "$validation_workflow" 'bash tests/script_contract.sh'
+assert_contains "$validation_workflow" 'bash tests/rclone_contract.sh'
 assert_contains "$validation_workflow" 'bash tests/tailscale_protocol.sh'
 assert_contains "$validation_workflow" './tests/windows_contract.ps1'
 assert_contains "$smoke_workflow" 'workflow_dispatch:'
@@ -78,6 +79,10 @@ assert_contains "$smoke_workflow" 'debug-session-smoke-windows'
 assert_not_contains "$smoke_workflow" 'ChocolateyInstall'
 
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
+    # shellcheck disable=SC2016
+    assert_contains "$workflow" 'RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}'
+    assert_not_contains "$workflow" 'enable_rclone'
+    assert_not_contains "$workflow" 'REMOTE_NAME'
     # shellcheck disable=SC2016
     assert_contains "$workflow" 'TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}'
     # shellcheck disable=SC2016

@@ -33,6 +33,7 @@ jobs:
       TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
       TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
       TAILSCALE_TAGS: tag:debug-session
+      RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
     steps:
       - name: Set smoke deadline
         run: echo "SESSION_DEADLINE_EPOCH=$(($(date +%s) + 50 * 60))" >> "$GITHUB_ENV"
@@ -56,6 +57,24 @@ jobs:
           command -v grok
           command -v zsh
           test -d "$HOME/.oh-my-zsh"
+      - name: Verify Linux rclone mounts
+        run: |
+          if [ -z "${RCLONE_CONFIG:-}" ]; then
+            echo 'RCLONE_CONFIG is empty; skipping rclone mount checks'
+            exit 0
+          fi
+          shopt -s nullglob
+          mounts=("$HOME"/cloud/*)
+          (( ${#mounts[@]} > 0 )) || {
+            echo 'RCLONE_CONFIG is set but no rclone mount points exist' >&2
+            exit 1
+          }
+          for mount in "${mounts[@]}"; do
+            mountpoint -q "$mount" || {
+              echo "rclone mount is missing: $mount" >&2
+              exit 1
+            }
+          done
       - name: Clean up Linux smoke session
         if: ${{ always() }}
         run: bash scripts/linux.sh cleanup
@@ -79,6 +98,7 @@ jobs:
       TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
       TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
       TAILSCALE_TAGS: tag:debug-session
+      RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
     steps:
       - name: Set smoke deadline
         shell: pwsh
@@ -112,6 +132,27 @@ jobs:
           if ('${{ inputs.enable_wsl }}' -eq 'true') {
             if ((wsl.exe --distribution Ubuntu --exec id -un).Trim() -ne 'runneradmin') {
               throw 'The WSL Environment user is not ready'
+            }
+          }
+      - name: Verify Windows rclone mounts
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RCLONE_CONFIG)) {
+            Write-Output 'RCLONE_CONFIG is empty; skipping rclone mount checks'
+            exit 0
+          }
+          $root = Join-Path $env:USERPROFILE 'cloud'
+          $mounts = @()
+          if (Test-Path -LiteralPath $root) {
+            $mounts = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
+          }
+          if ($mounts.Count -eq 0) {
+            throw 'RCLONE_CONFIG is set but no rclone mount points exist'
+          }
+          foreach ($mount in $mounts) {
+            $attrs = $mount.Attributes
+            if (-not ($attrs -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "rclone mount is missing: $($mount.FullName)"
             }
           }
       - name: Clean up Windows smoke session

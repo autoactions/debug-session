@@ -34,6 +34,7 @@ jobs:
         run: |
           bash tests/workflow_contract.sh
           bash tests/script_contract.sh
+          bash tests/rclone_contract.sh
           bash tests/tailscale_protocol.sh
 
   powershell:
