@@ -921,11 +921,15 @@ function Install-WinFspPackage {
 function Wait-RcloneMount {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $false)]$Process
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Process -and $Process.HasExited) {
+            return $false
+        }
         if (Test-Path -LiteralPath $Path) {
             $item = Get-Item -LiteralPath $Path -Force
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
@@ -948,11 +952,39 @@ function ConvertTo-WslWindowsPath {
     return $WindowsPath
 }
 
+function Initialize-RcloneWindowsMountPoint {
+    param([Parameter(Mandatory = $true)][string]$Remote)
+
+    $parent = Get-RcloneCloudRoot
+    New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    $dest = Join-Path $parent $Remote
+    if (Test-Path -LiteralPath $dest) {
+        $item = Get-Item -LiteralPath $dest -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "rclone mount point already in use: $dest"
+        }
+        Remove-Item -LiteralPath $dest -Recurse -Force
+    }
+    return $dest
+}
+
+function Get-RcloneLogSummary {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return 'rclone log is empty'
+    }
+    $lines = @(Get-Content -LiteralPath $Path -Tail 20 -ErrorAction SilentlyContinue)
+    if ($lines.Count -eq 0) {
+        return 'rclone log is empty'
+    }
+    return ($lines -join '; ')
+}
+
 function Mount-RcloneRemote {
     param([Parameter(Mandatory = $true)][string]$Remote)
 
-    $dest = Join-Path (Get-RcloneCloudRoot) $Remote
-    New-Item -Path $dest -ItemType Directory -Force | Out-Null
+    $dest = Initialize-RcloneWindowsMountPoint -Remote $Remote
     $logDir = Get-RcloneLogDirectory
     New-Item -Path $logDir -ItemType Directory -Force | Out-Null
     $logFile = Join-Path $logDir "rclone-$Remote.log"
@@ -961,13 +993,14 @@ function Mount-RcloneRemote {
         'mount', "${Remote}:", $dest,
         '--config', (Get-RcloneConfigPath),
         '--vfs-cache-mode', 'writes',
+        '--log-level', 'INFO',
         '--log-file', $logFile
     )
-    if (-not (Wait-RcloneMount -Path $dest -TimeoutSeconds 60)) {
+    if (-not (Wait-RcloneMount -Path $dest -TimeoutSeconds 60 -Process $process)) {
         if ($process -and -not $process.HasExited) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         }
-        throw "rclone mount did not become ready for $Remote"
+        throw "rclone mount did not become ready for ${Remote}: $(Get-RcloneLogSummary -Path $logFile)"
     }
     $wslPath = ConvertTo-WslWindowsPath -WindowsPath $dest
     Write-Output "[debug-session] rclone mount ready: $dest (WSL: $wslPath)"
@@ -981,6 +1014,10 @@ function Enable-RcloneMounts {
     try {
         Write-RcloneConfigFile
         Install-WinFspPackage
+        $launcher = Get-Service -Name 'WinFsp.Launcher' -ErrorAction SilentlyContinue
+        if ($launcher -and $launcher.Status -ne 'Running') {
+            Start-Service -Name 'WinFsp.Launcher'
+        }
         Install-RclonePackage
         $remotes = @(Get-RcloneRemoteNames -ConfigPath (Get-RcloneConfigPath))
         if ($remotes.Count -eq 0) {

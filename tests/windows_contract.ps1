@@ -136,6 +136,12 @@ if ($windowsScript -match 'Desktop\\STOP_SESSION') {
 if ($windowsScript -notmatch 'Enable-RcloneMounts') {
     throw 'Windows does not provision rclone mounts'
 }
+if ($windowsScript -notmatch 'Initialize-RcloneWindowsMountPoint') {
+    throw 'Windows does not prepare a WinFsp-compatible mount point'
+}
+if ($windowsScript -match 'New-Item -Path \$dest -ItemType Directory') {
+    throw 'Windows pre-creates the rclone mount leaf; WinFsp requires a nonexistent path'
+}
 if ($windowsScript -notmatch 'downloads\.rclone\.org/rclone-current-windows-') {
     throw 'Windows does not install rclone from the official current package'
 }
