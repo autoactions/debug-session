@@ -51,6 +51,7 @@ function Get-ValidatedSessionInput {
 
     $null = Assert-SessionPassword
     Assert-RcloneHomeLinks
+    Assert-GitWorkspaces
 
     return @{
         Deadline = $deadline
@@ -1662,11 +1663,179 @@ function Enable-RcloneHomeLinks {
     }
 }
 
+function Test-GitWorkspacesPresent {
+    return -not [string]::IsNullOrWhiteSpace($env:GIT_WORKSPACES)
+}
+
+function Get-GitWorkspaceRoot {
+    return (Join-Path $env:USERPROFILE 'workspaces')
+}
+
+function Test-GitWorkspaceNameValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+
+    if ($Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') {
+        return $false
+    }
+    if ($Name -eq '.' -or $Name -eq '..') {
+        return $false
+    }
+    return $true
+}
+
+function Test-GitWorkspaceUrlValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Url)
+
+    return [bool]($Url -match '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)+$')
+}
+
+function ConvertTo-GitWorkspaceNameFromUrl {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $rest = $Url.Substring('https://'.Length)
+    $slash = $rest.IndexOf('/')
+    if ($slash -lt 0) {
+        return ''
+    }
+    $name = $rest.Substring($slash + 1)
+    $name = $name.Split('/')[-1]
+    if ($name.EndsWith('.git')) {
+        $name = $name.Substring(0, $name.Length - 4)
+    }
+    return $name
+}
+
+function Get-GitWorkspaces {
+    $workspaces = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    $lineno = 0
+    foreach ($raw in ($env:GIT_WORKSPACES -split '\r?\n', [StringSplitOptions]::None)) {
+        $lineno += 1
+        $line = $raw.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+
+        $name = ''
+        $url = ''
+        if ($line -match '^[A-Za-z][A-Za-z0-9+.-]*://') {
+            $url = $line
+        } elseif ($line.Contains('=')) {
+            $separator = $line.IndexOf('=')
+            $name = $line.Substring(0, $separator).Trim()
+            $url = $line.Substring($separator + 1).Trim()
+        } else {
+            throw "GIT_WORKSPACES line $lineno is missing a URL"
+        }
+
+        $url = $url.TrimEnd('/')
+        if (-not (Test-GitWorkspaceUrlValid -Url $url)) {
+            throw "GIT_WORKSPACES URL is invalid: $url"
+        }
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = ConvertTo-GitWorkspaceNameFromUrl -Url $url
+        }
+        if (-not (Test-GitWorkspaceNameValid -Name $name)) {
+            throw "GIT_WORKSPACES name is invalid: $name"
+        }
+        if ($seen.ContainsKey($name)) {
+            throw "GIT_WORKSPACES has a duplicate name: $name"
+        }
+        $seen[$name] = $true
+        $workspaces.Add([pscustomobject]@{ Name = $name; Url = $url })
+    }
+    return $workspaces
+}
+
+function Assert-GitWorkspaces {
+    if (-not (Test-GitWorkspacesPresent)) {
+        return
+    }
+    $null = Get-GitWorkspaces
+}
+
+function Get-GitWorkspaceCredentialHelper {
+    return '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f'
+}
+
+function Test-GitAvailable {
+    return [bool](Get-Command git -ErrorAction SilentlyContinue)
+}
+
+function Add-GitWorkspace {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+
+    $dest = Join-Path (Get-GitWorkspaceRoot) $Name
+    if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
+        Write-Output "[debug-session] git workspace already present: $dest"
+        return
+    }
+    if (Test-Path -LiteralPath $dest) {
+        Write-Warning "Skipping git workspace ${Name}: $dest already exists"
+        return
+    }
+
+    try {
+        New-Item -Path (Get-GitWorkspaceRoot) -ItemType Directory -Force | Out-Null
+    } catch {
+        Write-Warning "Skipping git workspace ${Name}: could not create $(Get-GitWorkspaceRoot)"
+        return
+    }
+
+    $previousPrompt = $env:GIT_TERMINAL_PROMPT
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $gitArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:GIT_WORKSPACES_TOKEN)) {
+        $gitArgs += @('-c', 'credential.helper=', '-c', ('credential.helper=' + (Get-GitWorkspaceCredentialHelper)))
+    }
+    $gitArgs += @('clone', '--depth=1', '--', $Url, $dest)
+    & git @gitArgs
+    $cloneFailed = $LASTEXITCODE -ne 0
+    if ($null -ne $previousPrompt) {
+        $env:GIT_TERMINAL_PROMPT = $previousPrompt
+    } else {
+        Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
+    }
+    if (-not $cloneFailed) {
+        Write-Output "[debug-session] git workspace ready: $dest"
+        return
+    }
+    if (Test-Path -LiteralPath $dest) {
+        Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Warning "git clone failed for $Name"
+}
+
+function Enable-GitWorkspaces {
+    if (-not (Test-GitWorkspacesPresent)) {
+        return
+    }
+    if (-not (Test-GitAvailable)) {
+        Write-Warning 'git is unavailable; skipping git workspaces'
+        return
+    }
+
+    try {
+        $workspaces = @(Get-GitWorkspaces)
+    } catch {
+        Write-Warning 'GIT_WORKSPACES is invalid after validate; skipping git workspaces'
+        return
+    }
+
+    foreach ($workspace in $workspaces) {
+        Add-GitWorkspace -Name $workspace.Name -Url $workspace.Url
+    }
+}
+
 function Enter-DebugSession {
     $inputs = Get-ValidatedSessionInput
     Enter-CoreSession
     Enable-RcloneMounts
     Enable-RcloneHomeLinks
+    Enable-GitWorkspaces
     if ($inputs.SessionProfile -eq 'developer') {
         Install-DeveloperProfile
     }

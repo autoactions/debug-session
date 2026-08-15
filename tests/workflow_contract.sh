@@ -79,6 +79,10 @@ for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
     assert_contains "$workflow" 'RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}'
     # shellcheck disable=SC2016
     assert_contains "$workflow" 'RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}'
+    # shellcheck disable=SC2016
+    assert_contains "$workflow" 'GIT_WORKSPACES: ${{ vars.GIT_WORKSPACES }}'
+    # shellcheck disable=SC2016
+    assert_contains "$workflow" 'GIT_WORKSPACES_TOKEN: ${{ secrets.GIT_WORKSPACES_TOKEN }}'
     assert_not_contains "$workflow" 'enable_rclone'
     assert_not_contains "$workflow" 'HOME_REMAPS'
     assert_not_contains "$workflow" 'REMOTE_NAME'

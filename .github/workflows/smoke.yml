@@ -35,6 +35,8 @@ jobs:
       TAILSCALE_TAGS: tag:debug-session
       RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
       RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}
+      GIT_WORKSPACES: ${{ vars.GIT_WORKSPACES }}
+      GIT_WORKSPACES_TOKEN: ${{ secrets.GIT_WORKSPACES_TOKEN }}
     steps:
       - name: Set smoke deadline
         run: echo "SESSION_DEADLINE_EPOCH=$(($(date +%s) + 50 * 60))" >> "$GITHUB_ENV"
@@ -103,6 +105,22 @@ jobs:
               exit 1
             }
           done < <(parse_rclone_home_links)
+      - name: Verify Linux git workspaces
+        run: |
+          if [ -z "${GIT_WORKSPACES:-}" ]; then
+            echo 'GIT_WORKSPACES is empty; skipping git workspace checks'
+            exit 0
+          fi
+          # shellcheck disable=SC1091
+          source scripts/linux.sh
+          while IFS=$'\t' read -r name url; do
+            [[ -n "$name" ]] || continue
+            dest="$HOME/workspaces/$name"
+            [[ -d "$dest/.git" ]] || {
+              echo "git workspace missing: $dest" >&2
+              exit 1
+            }
+          done < <(parse_git_workspaces)
       - name: Clean up Linux smoke session
         if: ${{ always() }}
         run: bash scripts/linux.sh cleanup
@@ -128,6 +146,8 @@ jobs:
       TAILSCALE_TAGS: tag:debug-session
       RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
       RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}
+      GIT_WORKSPACES: ${{ vars.GIT_WORKSPACES }}
+      GIT_WORKSPACES_TOKEN: ${{ secrets.GIT_WORKSPACES_TOKEN }}
     steps:
       - name: Set smoke deadline
         shell: pwsh
@@ -217,6 +237,27 @@ jobs:
             }
             if (-not (Test-HomeLinkMatches -Item $item -Destination $dest -RelativeTarget $rel)) {
               throw "home link $dest points at $(@($item.Target)[0]), expected $rel"
+            }
+          }
+      - name: Verify Windows git workspaces
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GIT_WORKSPACES)) {
+            Write-Output 'GIT_WORKSPACES is empty; skipping git workspace checks'
+            exit 0
+          }
+          $windowsScript = Get-Content -LiteralPath './scripts/windows.ps1' -Raw
+          $start = $windowsScript.IndexOf('function Test-GitWorkspacesPresent')
+          $end = $windowsScript.IndexOf('function Enable-GitWorkspaces')
+          if ($start -lt 0 -or $end -lt 0 -or $end -le $start) {
+            throw 'Windows is missing git workspace helper functions'
+          }
+          Invoke-Expression $windowsScript.Substring($start, $end - $start)
+          $root = Join-Path $env:USERPROFILE 'workspaces'
+          foreach ($workspace in @(Get-GitWorkspaces)) {
+            $dest = Join-Path $root $workspace.Name
+            if (-not (Test-Path -LiteralPath (Join-Path $dest '.git'))) {
+              throw "git workspace missing: $dest"
             }
           }
       - name: Clean up Windows smoke session

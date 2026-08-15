@@ -36,6 +36,7 @@ jobs:
           bash tests/script_contract.sh
           bash tests/rclone_contract.sh
           bash tests/rclone_home_links_contract.sh
+          bash tests/git_workspaces_contract.sh
           bash tests/tailscale_protocol.sh
 
   powershell:

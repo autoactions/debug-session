@@ -113,6 +113,43 @@ try {
 }
 Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
 
+$env:GIT_WORKSPACES = @"
+# comment
+https://github.com/org/proj-a
+my-app=https://github.com/org/proj-c
+"@
+Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
+    -Candidate '12345678'
+Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
+
+$env:GIT_WORKSPACES = "https://github.com/org/a`nhttps://github.com/other/a.git"
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a duplicate GIT_WORKSPACES name'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a duplicate GIT_WORKSPACES name') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*duplicate name*') {
+        throw "Windows validation returned an unexpected git workspace error: $_"
+    }
+}
+Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
+
+$env:GIT_WORKSPACES = 'https://user:pass@github.com/org/proj'
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a GIT_WORKSPACES URL with userinfo'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a GIT_WORKSPACES URL with userinfo') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*URL is invalid*') {
+        throw "Windows validation returned an unexpected git workspace URL error: $_"
+    }
+}
+Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
+
 Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
     -Candidate '12345678'
 
@@ -219,6 +256,12 @@ if ($windowsScript -notmatch 'Close-RcloneMounts') {
 if ($windowsScript -notmatch 'Enable-RcloneHomeLinks') {
     throw 'Windows does not provision rclone home links'
 }
+if ($windowsScript -notmatch 'Enable-GitWorkspaces') {
+    throw 'Windows does not provision git workspaces'
+}
+if ($windowsScript -notmatch "Join-Path \$env:USERPROFILE 'workspaces'") {
+    throw 'Windows does not clone git workspaces under the user workspaces directory'
+}
 if ($windowsScript -match 'home links are not implemented on Windows') {
     throw 'Windows still no-ops rclone home links'
 }
@@ -229,13 +272,14 @@ if ($windowsScript -notmatch 'Wait-RcloneExit') {
 $enableCore = $windowsScript.LastIndexOf('Enter-CoreSession')
 $enableRclone = $windowsScript.LastIndexOf('Enable-RcloneMounts')
 $enableLinks = $windowsScript.LastIndexOf('Enable-RcloneHomeLinks')
+$enableGit = $windowsScript.LastIndexOf('Enable-GitWorkspaces')
 $enableDeveloper = $windowsScript.LastIndexOf('Install-DeveloperProfile')
 $enableWsl = $windowsScript.LastIndexOf('Initialize-WslUbuntu')
-if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableLinks -lt 0 -or $enableDeveloper -lt 0 -or $enableWsl -lt 0) {
-    throw 'Windows session startup is missing core, rclone, home links, developer, or WSL steps'
+if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableLinks -lt 0 -or $enableGit -lt 0 -or $enableDeveloper -lt 0 -or $enableWsl -lt 0) {
+    throw 'Windows session startup is missing core, rclone, home links, git workspaces, developer, or WSL steps'
 }
-if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableLinks -and $enableLinks -lt $enableDeveloper -and $enableLinks -lt $enableWsl)) {
-    throw 'Windows does not apply home links after rclone mounts and before Developer/WSL'
+if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableLinks -and $enableLinks -lt $enableGit -and $enableGit -lt $enableDeveloper -and $enableGit -lt $enableWsl)) {
+    throw 'Windows does not clone git workspaces after home links and before Developer/WSL'
 }
 if ($windowsScript -notmatch '\$env:WSL_UTF8 = ''1''') {
     throw 'Windows does not force UTF-8 WSL CLI output'
@@ -487,6 +531,46 @@ try {
 
 if ($windowsScript -notmatch '(?s)function Get-RcloneWritebackWaitSeconds\s*\{\s*return 120') {
     throw 'Windows rclone write-back wait is not 120 seconds'
+}
+
+$gitStart = $windowsScript.IndexOf('function Test-GitWorkspacesPresent')
+$gitEnd = $windowsScript.IndexOf('function Enable-GitWorkspaces')
+if ($gitStart -lt 0 -or $gitEnd -lt 0 -or $gitEnd -le $gitStart) {
+    throw 'Windows is missing git workspace helper functions'
+}
+Invoke-Expression $windowsScript.Substring($gitStart, $gitEnd - $gitStart)
+
+$env:GIT_WORKSPACES = @"
+# keep
+https://github.com/org/proj-a.git
+my-app=https://github.com/org/proj-c
+"@
+$gitParsed = @(Get-GitWorkspaces)
+if ($gitParsed.Count -ne 2) {
+    throw "Windows parsed $($gitParsed.Count) git workspaces, expected 2"
+}
+if ($gitParsed[0].Name -ne 'proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
+    throw "Windows first git workspace was $($gitParsed[0].Name)=$($gitParsed[0].Url)"
+}
+if ($gitParsed[1].Name -ne 'my-app' -or $gitParsed[1].Url -ne 'https://github.com/org/proj-c') {
+    throw "Windows custom-name git workspace was $($gitParsed[1].Name)=$($gitParsed[1].Url)"
+}
+Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
+
+if ((Get-GitWorkspaceCredentialHelper) -cne '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f') {
+    throw 'Windows credential helper does not read GIT_WORKSPACES_TOKEN from the environment'
+}
+if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/org/proj-b.git') -ne 'proj-b') {
+    throw 'Windows did not strip .git from the derived workspace name'
+}
+if (-not (Test-GitWorkspaceUrlValid -Url 'https://gitlab.example.com:8443/group/sub/repo.git')) {
+    throw 'Windows rejected a valid git workspace URL with a port'
+}
+if (Test-GitWorkspaceUrlValid -Url 'https://user:pass@github.com/org/proj') {
+    throw 'Windows accepted a git workspace URL with userinfo'
+}
+if (Test-GitWorkspaceNameValid -Name '..') {
+    throw 'Windows accepted .. as a git workspace name'
 }
 
 Write-Output 'Windows input behavior: PASS'

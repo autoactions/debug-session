@@ -131,4 +131,23 @@ if grep -Fq 'STOP_SESSION_HERE' "$linux_script"; then
     fail 'Linux still writes the STOP_SESSION_HERE instruction file'
 fi
 
+if ! awk '/^validate_inputs\(\)/,/^}/' "$linux_script" | grep -Fq 'validate_git_workspaces'; then
+    fail 'Linux does not validate GIT_WORKSPACES during input validation'
+fi
+# shellcheck disable=SC2016
+grep -Fq 'enable_git_workspaces' "$linux_script" ||
+    fail 'Linux does not provision git workspaces'
+ready_after_links="$(awk '/^run_session\(\)/,/^}/' "$linux_script")"
+printf '%s\n' "$ready_after_links" | grep -Fq 'enable_rclone_home_links' ||
+    fail 'Linux run_session is missing rclone home links'
+printf '%s\n' "$ready_after_links" | grep -Fq 'enable_git_workspaces' ||
+    fail 'Linux run_session is missing git workspaces'
+links_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'enable_rclone_home_links' | head -n1 | cut -d: -f1)"
+workspaces_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'enable_git_workspaces' | head -n1 | cut -d: -f1)"
+developer_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'install_developer_profile' | head -n1 | cut -d: -f1)"
+[[ -n "$links_line" && -n "$workspaces_line" && -n "$developer_line" ]] ||
+    fail 'Linux run_session is missing home links, git workspaces, or developer profile'
+(( links_line < workspaces_line && workspaces_line < developer_line )) ||
+    fail 'Linux does not clone git workspaces after home links and before the Developer Profile'
+
 printf 'Linux input behavior: PASS\n'

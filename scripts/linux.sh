@@ -61,6 +61,7 @@ validate_inputs() {
 
     validate_session_password
     validate_rclone_home_links
+    validate_git_workspaces
 }
 
 apt_prerequisites_present() {
@@ -1038,10 +1039,168 @@ enable_rclone_home_links() {
     return 0
 }
 
+git_workspaces_present() {
+    [[ -n "${GIT_WORKSPACES:-}" ]]
+}
+
+workspace_root() {
+    printf '%s/workspaces' "$HOME"
+}
+
+git_workspace_name_valid() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
+    [[ "$name" != '.' && "$name" != '..' ]] || return 1
+    return 0
+}
+
+git_workspace_url_valid() {
+    local url="$1"
+    [[ "$url" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)+$ ]]
+}
+
+git_workspace_name_from_url() {
+    local url="$1"
+    local rest name
+    rest="${url#https://}"
+    rest="${rest#*/}"
+    name="${rest##*/}"
+    name="${name%.git}"
+    printf '%s\n' "$name"
+}
+
+parse_git_workspaces() {
+    local raw line name url
+    local -A seen=()
+    local lineno=0
+
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        lineno=$((lineno + 1))
+        line="${raw%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        name=''
+        url=''
+        if [[ "$line" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+            url="$line"
+        elif [[ "$line" == *=* ]]; then
+            name="${line%%=*}"
+            url="${line#*=}"
+            name="${name#"${name%%[![:space:]]*}"}"
+            name="${name%"${name##*[![:space:]]}"}"
+            url="${url#"${url%%[![:space:]]*}"}"
+            url="${url%"${url##*[![:space:]]}"}"
+        else
+            printf 'GIT_WORKSPACES line %s is missing a URL\n' "$lineno" >&2
+            return 1
+        fi
+
+        while [[ "$url" == */ ]]; do
+            url="${url%/}"
+        done
+        if ! git_workspace_url_valid "$url"; then
+            printf 'GIT_WORKSPACES URL is invalid: %s\n' "$url" >&2
+            return 1
+        fi
+        if [[ -z "$name" ]]; then
+            name="$(git_workspace_name_from_url "$url")"
+        fi
+        if ! git_workspace_name_valid "$name"; then
+            printf 'GIT_WORKSPACES name is invalid: %s\n' "$name" >&2
+            return 1
+        fi
+        if [[ -n "${seen[$name]:-}" ]]; then
+            printf 'GIT_WORKSPACES has a duplicate name: %s\n' "$name" >&2
+            return 1
+        fi
+        seen[$name]=1
+        printf '%s\t%s\n' "$name" "$url"
+    done <<< "${GIT_WORKSPACES:-}"
+}
+
+validate_git_workspaces() {
+    if ! git_workspaces_present; then
+        return 0
+    fi
+    parse_git_workspaces >/dev/null
+}
+
+git_workspace_credential_helper() {
+    # The helper must expand GIT_WORKSPACES_TOKEN in git's shell, not here.
+    # shellcheck disable=SC2016
+    printf '%s\n' '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f'
+}
+
+ensure_git() {
+    if command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git
+}
+
+clone_git_workspace() {
+    local name="$1"
+    local url="$2"
+    local dest
+    dest="$(workspace_root)/$name"
+
+    if [[ -d "$dest/.git" ]]; then
+        log "git workspace already present: $dest"
+        return 0
+    fi
+    if [[ -e "$dest" ]]; then
+        warn "Skipping git workspace ${name}: ${dest} already exists"
+        return 0
+    fi
+
+    if ! mkdir -p -- "$(workspace_root)"; then
+        warn "Skipping git workspace ${name}: could not create $(workspace_root)"
+        return 0
+    fi
+
+    local -a git_cmd=(git)
+    if [[ -n "${GIT_WORKSPACES_TOKEN:-}" ]]; then
+        git_cmd+=(-c credential.helper= -c "credential.helper=$(git_workspace_credential_helper)")
+    fi
+    git_cmd+=(clone --depth=1 -- "$url" "$dest")
+    if GIT_TERMINAL_PROMPT=0 "${git_cmd[@]}"; then
+        log "git workspace ready: $dest"
+        return 0
+    fi
+    rm -rf -- "$dest"
+    warn "git clone failed for ${name}"
+    return 0
+}
+
+enable_git_workspaces() {
+    if ! git_workspaces_present; then
+        return 0
+    fi
+    if ! ensure_git; then
+        warn 'git is unavailable; skipping git workspaces'
+        return 0
+    fi
+    if ! parse_git_workspaces >/dev/null; then
+        warn 'GIT_WORKSPACES is invalid after validate; skipping git workspaces'
+        return 0
+    fi
+
+    local name url
+    while IFS=$'\t' read -r name url; do
+        [[ -n "$name" ]] || continue
+        clone_git_workspace "$name" "$url"
+    done < <(parse_git_workspaces)
+    return 0
+}
+
 run_session() {
     enable_core_session
     enable_rclone_mounts
     enable_rclone_home_links
+    enable_git_workspaces
     if [[ "$ACCESS_PROFILE" == full ]]; then
         enable_xfce_rdp || true
     fi
