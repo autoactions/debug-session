@@ -168,6 +168,99 @@ if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableDeveloper -lt 0 -or $en
 if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableDeveloper -and $enableRclone -lt $enableWsl)) {
     throw 'Windows does not mount rclone after Core Session ready and before Developer/WSL'
 }
+if ($windowsScript -notmatch '\$env:WSL_UTF8 = ''1''') {
+    throw 'Windows does not force UTF-8 WSL CLI output'
+}
+if ($windowsScript -match '(?s)--set-version \$distribution 2\s+if \(\$LASTEXITCODE -ne 0\) \{ throw ''Could not configure Ubuntu to use WSL 2'' \}') {
+    throw 'Windows treats a no-op WSL --set-version as fatal'
+}
+if ($windowsScript -match '(?s)--list --verbose.*if \(\$LASTEXITCODE -ne 0\) \{ throw ''Could not list installed WSL distributions'' \}') {
+    throw 'Windows treats an empty WSL list as a list failure'
+}
+if ($windowsScript -match '--exec sh -c \$initializeUser') {
+    throw 'Windows still passes a multiline script to sh -c'
+}
+if ($windowsScript -notmatch 'UbuntuInsightsConsent') {
+    throw 'Windows does not pre-seed Ubuntu Insights consent'
+}
+if ($windowsScript -notmatch '--distribution \$distribution /bin/true') {
+    throw 'Windows does not complete Ubuntu first-launch setup without --exec'
+}
+
+$helperStart = $windowsScript.IndexOf('function Get-WslTextLines')
+$helperEnd = $windowsScript.IndexOf('function Initialize-WslUbuntu')
+if ($helperStart -lt 0 -or $helperEnd -lt 0 -or $helperEnd -le $helperStart) {
+    throw 'Windows is missing WSL list helper functions'
+}
+Invoke-Expression $windowsScript.Substring($helperStart, $helperEnd - $helperStart)
+
+function Assert-WslVersionResolve {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Output,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        $Expected,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $got = Resolve-WslDistributionVersion -Output $Output -ExitCode $ExitCode -Distribution 'Ubuntu'
+    if ($got -ne $Expected) {
+        throw "$Label`: expected '$Expected', received '$got'"
+    }
+}
+
+Assert-WslVersionResolve -Output @(
+    'Windows Subsystem for Linux has no installed distributions.',
+    'You can resolve this by installing a distribution with the instructions below:'
+) -ExitCode -1 -Expected $null -Label 'WSL empty-list message'
+Assert-WslVersionResolve -Output @() -ExitCode 1 -Expected $null -Label 'WSL empty captured output'
+Assert-WslVersionResolve -Output @(
+    'Error code: Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND'
+) -ExitCode 1 -Expected $null -Label 'WSL default distro missing'
+Assert-WslVersionResolve -Output @(
+    '  NAME      STATE           VERSION',
+    '* Ubuntu    Stopped         2'
+) -ExitCode 0 -Expected '2' -Label 'Ubuntu already on WSL 2'
+Assert-WslVersionResolve -Output @(
+    ("* Ubuntu`0    Stopped         2")
+) -ExitCode 0 -Expected '2' -Label 'UTF-16 WSL list row'
+Assert-WslVersionResolve -Output @(
+    '  NAME            STATE           VERSION',
+    '  Ubuntu-24.04    Stopped         2'
+) -ExitCode 0 -Expected $null -Label 'different distro present'
+
+try {
+    Resolve-WslDistributionVersion -Output @('Access is denied') -ExitCode 1 -Distribution 'Ubuntu'
+    throw 'Windows accepted an unexpected WSL list failure'
+} catch {
+    if ($_.Exception.Message -eq 'Windows accepted an unexpected WSL list failure') {
+        throw
+    }
+    if ($_.Exception.Message -notlike 'Could not list installed WSL distributions*') {
+        throw "Windows returned an unexpected WSL list error: $_"
+    }
+}
+
+$initScript = Get-WslRootInitScript
+if ($initScript -notmatch '(?m)^set -eu$') {
+    throw 'WSL root init script does not start with set -eu'
+}
+if ($initScript -notmatch 'ubuntu-insights consent wsl_setup -s=false') {
+    throw 'WSL root init script does not opt out of Ubuntu Insights'
+}
+$scriptFile = Join-Path ([System.IO.Path]::GetTempPath()) 'debug-session-wsl-init-test.sh'
+try {
+    Write-WslUnixScript -Path $scriptFile -Script "set -eu`r`nif true; then`r`n  echo hi`r`nfi`r`n"
+    $written = [System.IO.File]::ReadAllBytes($scriptFile)
+    if ($written -contains 13) {
+        throw 'WSL unix script still contains carriage returns'
+    }
+    $text = [System.Text.Encoding]::UTF8.GetString($written)
+    if (-not $text.StartsWith("set -eu`n")) {
+        throw "WSL unix script did not start with LF-terminated set -eu: $text"
+    }
+} finally {
+    Remove-Item -LiteralPath $scriptFile -Force -ErrorAction SilentlyContinue
+}
 
 $closeRclone = $windowsScript.LastIndexOf('Close-RcloneMounts')
 $logout = $windowsScript.LastIndexOf('$tailscale logout')

@@ -635,30 +635,69 @@ function Install-DeveloperProfile {
     }
 }
 
-function Initialize-WslUbuntu {
-    $distribution = 'Ubuntu'
-    $wsl = (Get-Command wsl.exe -ErrorAction Stop).Source
+function Get-WslTextLines {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][object[]]$Output)
 
-    $distributions = @(& $wsl --list --quiet)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Could not list installed WSL distributions'
+    if ($null -eq $Output) {
+        return @()
     }
-    $ubuntuInstalled = $distributions | Where-Object { $_.Trim() -eq $distribution }
-    if (-not $ubuntuInstalled) {
-        & $wsl --install --distribution $distribution --no-launch --web-download
-        if ($LASTEXITCODE -ne 0) {
-            throw 'Ubuntu installation for WSL failed'
+    return @(
+        $Output | ForEach-Object {
+            $line = [string]$_
+            if ($line.Contains([char]0)) {
+                $line = $line.Replace([string][char]0, '')
+            }
+            $line.Trim()
+        } | Where-Object { $_ }
+    )
+}
+
+function Test-WslNoDistributionsOutput {
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+    return $Text -match 'no installed distributions' -or
+        $Text -match 'WSL_E_DEFAULT_DISTRO_NOT_FOUND'
+}
+
+function Resolve-WslDistributionVersion {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][object[]]$Output,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][string]$Distribution
+    )
+
+    $lines = Get-WslTextLines -Output $Output
+    $text = $lines -join "`n"
+    if (Test-WslNoDistributionsOutput -Text $text) {
+        return $null
+    }
+
+    foreach ($line in $lines) {
+        if ($line -match '^(?:\*\s*)?(\S+)\s+\S+\s+(\d+)\s*$' -and $Matches[1] -eq $Distribution) {
+            return $Matches[2]
         }
     }
+    if ($ExitCode -eq 0 -or [string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+    throw "Could not list installed WSL distributions: $text"
+}
 
-    & $wsl --set-default-version 2
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set WSL 2 as the default version' }
-    & $wsl --set-version $distribution 2
-    if ($LASTEXITCODE -ne 0) { throw 'Could not configure Ubuntu to use WSL 2' }
-    & $wsl --set-default $distribution
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set Ubuntu as the default WSL distribution' }
+function Get-WslDistributionVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Wsl,
+        [Parameter(Mandatory = $true)][string]$Distribution
+    )
 
-    $initializeUser = @'
+    $output = & $Wsl --list --verbose 2>&1
+    return (Resolve-WslDistributionVersion -Output @($output) -ExitCode $LASTEXITCODE -Distribution $Distribution)
+}
+
+function Get-WslRootInitScript {
+    return @'
 set -eu
 if ! command -v sudo >/dev/null 2>&1; then
     apt-get update
@@ -670,13 +709,86 @@ fi
 printf '%s\n' 'runneradmin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runneradmin
 chmod 0440 /etc/sudoers.d/runneradmin
 printf '[user]\ndefault=runneradmin\n' > /etc/wsl.conf
+if command -v ubuntu-insights >/dev/null 2>&1; then
+    su runneradmin -c 'ubuntu-insights consent wsl_setup -s=false' >/dev/null 2>&1 || true
+fi
 '@
-    & $wsl --distribution $distribution --user root --exec sh -c $initializeUser
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Could not initialize the runneradmin user in Ubuntu'
+}
+
+function Set-UbuntuInsightsConsent {
+    $path = 'HKCU:\Software\Canonical\Ubuntu'
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -Path $path -Force | Out-Null
     }
+    New-ItemProperty -Path $path -Name 'UbuntuInsightsConsent' -Value 0 -PropertyType DWord -Force | Out-Null
+}
+
+function Write-WslUnixScript {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Script
+    )
+
+    $unix = $Script.Replace("`r`n", "`n").Replace("`r", "`n").Trim() + "`n"
+    [System.IO.File]::WriteAllText($Path, $unix, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Invoke-WslRootScript {
+    param(
+        [Parameter(Mandatory = $true)][string]$Wsl,
+        [Parameter(Mandatory = $true)][string]$Distribution,
+        [Parameter(Mandatory = $true)][string]$Script
+    )
+
+    $temp = Join-Path $env:TEMP 'debug-session-wsl-init.sh'
+    Write-WslUnixScript -Path $temp -Script $Script
+    try {
+        $linuxPath = ConvertTo-WslWindowsPath -WindowsPath $temp
+        & $Wsl --distribution $Distribution --user root -- /bin/true
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not start Ubuntu as root'
+        }
+        & $Wsl --distribution $Distribution --user root -- /bin/bash $linuxPath
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not initialize the runneradmin user in Ubuntu'
+        }
+    } finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-WslUbuntu {
+    $distribution = 'Ubuntu'
+    $wsl = (Get-Command wsl.exe -ErrorAction Stop).Source
+    $env:WSL_UTF8 = '1'
+
+    & $wsl --set-default-version 2
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set WSL 2 as the default version' }
+
+    if ($null -eq (Get-WslDistributionVersion -Wsl $wsl -Distribution $distribution)) {
+        & $wsl --install --distribution $distribution --no-launch --web-download
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Ubuntu installation for WSL failed'
+        }
+    }
+
+    if ((Get-WslDistributionVersion -Wsl $wsl -Distribution $distribution) -ne '2') {
+        & $wsl --set-version $distribution 2
+        if ((Get-WslDistributionVersion -Wsl $wsl -Distribution $distribution) -ne '2') {
+            throw 'Could not configure Ubuntu to use WSL 2'
+        }
+    }
+    & $wsl --set-default $distribution
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set Ubuntu as the default WSL distribution' }
+
+    Set-UbuntuInsightsConsent
+    Invoke-WslRootScript -Wsl $wsl -Distribution $distribution -Script (Get-WslRootInitScript)
     & $wsl --terminate $distribution
     if ($LASTEXITCODE -ne 0) { throw 'Could not restart Ubuntu after configuring its default user' }
+    & $wsl --distribution $distribution /bin/true
+    if ($LASTEXITCODE -ne 0) { throw 'Could not complete Ubuntu first-launch setup' }
+    & $wsl --terminate $distribution
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restart Ubuntu after first-launch setup' }
 
     $defaultUser = (& $wsl --exec id -un).Trim()
     if ($LASTEXITCODE -ne 0 -or $defaultUser -ne 'runneradmin') {
