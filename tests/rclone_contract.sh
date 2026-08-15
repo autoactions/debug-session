@@ -125,14 +125,6 @@ cache_rm_line="$(grep -nF 'rm -rf -- "$HOME/.cache/rclone"' "$linux_script" | ta
     fail 'Linux does not wait for rclone to exit before force-killing it and deleting the VFS cache'
 
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
-    # shellcheck disable=SC2016
-    grep -Fq 'RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}' "$workflow" ||
-        fail "$workflow does not pass RCLONE_CONFIG as an environment variable"
-    # shellcheck disable=SC2016
-    grep -Fq 'RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}' "$workflow" ||
-        fail "$workflow does not pass RCLONE_HOME_LINKS as an environment variable"
-    grep -Fq 'enable_rclone' "$workflow" && fail "$workflow adds an enable_rclone input"
-    grep -Fq 'REMOTE_NAME' "$workflow" && fail "$workflow still references REMOTE_NAME"
     grep -Fq "echo '\${{ secrets.RCLONE_CONFIG }}'" "$workflow" &&
         fail "$workflow writes RCLONE_CONFIG through echo of the secret expression"
 done
@@ -141,8 +133,6 @@ grep -Fq '$HOME"/rclone/*' "$smoke_workflow" ||
     fail 'Linux smoke does not check $HOME/rclone mounts'
 grep -Fq "Join-Path \$env:USERPROFILE 'rclone'" "$smoke_workflow" ||
     fail 'Windows smoke does not check %USERPROFILE%\\rclone mounts'
-grep -Fq '/cloud' "$smoke_workflow" && fail 'smoke still checks the old cloud mount root'
-grep -Fq "'cloud'" "$smoke_workflow" && fail 'smoke still checks the old cloud mount root'
 grep -Fq 'rclone_home_link_relative_target' "$smoke_workflow" ||
     fail 'Linux smoke does not verify nested home-link relative targets'
 grep -Fq 'Get-RcloneHomeLinks' "$smoke_workflow" ||

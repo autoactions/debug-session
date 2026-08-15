@@ -17,7 +17,7 @@ on:
         options:
           - core
           - developer
-        default: core
+        default: developer
         required: true
 
 permissions:

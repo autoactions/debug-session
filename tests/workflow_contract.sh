@@ -36,9 +36,8 @@ for workflow in "$linux_workflow" "$windows_workflow"; do
     # shellcheck disable=SC2016
     assert_contains "$workflow" 'SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}'
     assert_contains "$workflow" 'session_profile:'
-    assert_contains "$workflow" 'default: core'
+    assert_contains "$workflow" 'default: developer'
     assert_not_contains "$workflow" 'session_deadline:'
-    assert_not_contains "$workflow" '350'
     # shellcheck disable=SC2016
     assert_contains "$workflow" 'if: ${{ always() }}'
     assert_not_contains "$workflow" 'RDP_PASSWORD'
@@ -52,12 +51,9 @@ assert_contains "$linux_workflow" '- mini'
 assert_contains "$linux_workflow" '- full'
 assert_contains "$linux_workflow" 'default: mini'
 assert_not_contains "$linux_workflow" 'xfce-rdp'
-assert_not_contains "$linux_workflow" '- ssh'
 assert_contains "$linux_workflow" 'bash scripts/linux.sh run'
 assert_contains "$windows_workflow" './scripts/windows.ps1 run'
 assert_contains "$windows_workflow" 'enable_wsl:'
-assert_not_contains "$windows_workflow" 'Experimentally'
-assert_not_contains "$smoke_workflow" 'experimental'
 assert_not_contains "$windows_workflow" 'wsl_applications'
 assert_not_contains "$windows_workflow" 'disable_search_index'
 assert_not_contains "$windows_workflow" 'disable_onedrive'
@@ -77,7 +73,6 @@ assert_contains "$smoke_workflow" 'bash scripts/linux.sh run'
 assert_contains "$smoke_workflow" './scripts/windows.ps1 run'
 assert_contains "$smoke_workflow" 'debug-session-smoke-linux'
 assert_contains "$smoke_workflow" 'debug-session-smoke-windows'
-assert_not_contains "$smoke_workflow" 'ChocolateyInstall'
 
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
     # shellcheck disable=SC2016

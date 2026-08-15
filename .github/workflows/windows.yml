@@ -9,7 +9,7 @@ on:
         options:
           - core
           - developer
-        default: core
+        default: developer
         required: true
       enable_wsl:
         description: Initialize Ubuntu on WSL
