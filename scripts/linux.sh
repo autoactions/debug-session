@@ -1104,12 +1104,11 @@ git_workspace_name_from_shorthand() {
 
 git_workspace_name_from_url() {
     local url="$1"
-    local rest name
+    local rest
     rest="${url#https://}"
     rest="${rest#*/}"
-    name="${rest##*/}"
-    name="${name%.git}"
-    printf '%s\n' "$name"
+    rest="${rest%.git}"
+    printf '%s\n' "$rest"
 }
 
 parse_git_workspaces() {

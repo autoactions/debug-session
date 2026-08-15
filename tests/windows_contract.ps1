@@ -551,7 +551,7 @@ $gitParsed = @(Get-GitWorkspaces)
 if ($gitParsed.Count -ne 3) {
     throw "Windows parsed $($gitParsed.Count) git workspaces, expected 3"
 }
-if ($gitParsed[0].Name -ne 'proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
+if ($gitParsed[0].Name -ne 'org/proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
     throw "Windows first git workspace was $($gitParsed[0].Name)=$($gitParsed[0].Url)"
 }
 if ($gitParsed[1].Name -ne 'my-app' -or $gitParsed[1].Url -ne 'https://github.com/org/proj-c') {
@@ -565,8 +565,11 @@ Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
 if ((Get-GitWorkspaceCredentialHelper) -cne '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f') {
     throw 'Windows credential helper does not read GIT_WORKSPACES_TOKEN from the environment'
 }
-if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/org/proj-b.git') -ne 'proj-b') {
-    throw 'Windows did not strip .git from the derived workspace name'
+if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/org/proj-b.git') -ne 'org/proj-b') {
+    throw 'Windows did not keep owner/repo from the URL'
+}
+if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/autoactions/debug-session') -ne 'autoactions/debug-session') {
+    throw 'Windows did not derive autoactions/debug-session from the GitHub URL'
 }
 if (-not (Test-GitWorkspaceUrlValid -Url 'https://gitlab.example.com:8443/group/sub/repo.git')) {
     throw 'Windows rejected a valid git workspace URL with a port'

@@ -1764,7 +1764,6 @@ function ConvertTo-GitWorkspaceNameFromUrl {
         return ''
     }
     $name = $rest.Substring($slash + 1)
-    $name = $name.Split('/')[-1]
     if ($name.EndsWith('.git')) {
         $name = $name.Substring(0, $name.Length - 4)
     }
