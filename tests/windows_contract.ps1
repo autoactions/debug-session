@@ -117,6 +117,7 @@ $env:GIT_WORKSPACES = @"
 # comment
 https://github.com/org/proj-a
 my-app=https://github.com/org/proj-c
+org/priv
 "@
 Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
     -Candidate '12345678'
@@ -544,16 +545,20 @@ $env:GIT_WORKSPACES = @"
 # keep
 https://github.com/org/proj-a.git
 my-app=https://github.com/org/proj-c
+org/priv
 "@
 $gitParsed = @(Get-GitWorkspaces)
-if ($gitParsed.Count -ne 2) {
-    throw "Windows parsed $($gitParsed.Count) git workspaces, expected 2"
+if ($gitParsed.Count -ne 3) {
+    throw "Windows parsed $($gitParsed.Count) git workspaces, expected 3"
 }
 if ($gitParsed[0].Name -ne 'proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
     throw "Windows first git workspace was $($gitParsed[0].Name)=$($gitParsed[0].Url)"
 }
 if ($gitParsed[1].Name -ne 'my-app' -or $gitParsed[1].Url -ne 'https://github.com/org/proj-c') {
     throw "Windows custom-name git workspace was $($gitParsed[1].Name)=$($gitParsed[1].Url)"
+}
+if ($gitParsed[2].Name -ne 'org/priv' -or $gitParsed[2].Url -ne 'https://github.com/org/priv') {
+    throw "Windows shorthand git workspace was $($gitParsed[2].Name)=$($gitParsed[2].Url)"
 }
 Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
 
@@ -571,6 +576,15 @@ if (Test-GitWorkspaceUrlValid -Url 'https://user:pass@github.com/org/proj') {
 }
 if (Test-GitWorkspaceNameValid -Name '..') {
     throw 'Windows accepted .. as a git workspace name'
+}
+if (-not (Test-GitWorkspaceShorthandValid -Spec 'org/priv')) {
+    throw 'Windows rejected the org/priv git workspace shorthand'
+}
+if (Test-GitWorkspaceShorthandValid -Spec 'org/priv/extra') {
+    throw 'Windows accepted a three-segment git workspace shorthand'
+}
+if (-not (Test-GitWorkspaceNameValid -Name 'org/priv')) {
+    throw 'Windows rejected org/priv as a git workspace name'
 }
 
 Write-Output 'Windows input behavior: PASS'

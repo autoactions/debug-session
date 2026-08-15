@@ -1047,16 +1047,59 @@ workspace_root() {
     printf '%s/workspaces' "$HOME"
 }
 
+git_workspace_name_component_valid() {
+    local part="$1"
+    [[ "$part" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
+    [[ "$part" != '.' && "$part" != '..' ]] || return 1
+    return 0
+}
+
 git_workspace_name_valid() {
     local name="$1"
-    [[ "$name" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
-    [[ "$name" != '.' && "$name" != '..' ]] || return 1
+    local part
+    local -a parts
+    [[ -n "$name" ]] || return 1
+    [[ "$name" != /* && "$name" != */ && "$name" != *//* ]] || return 1
+    IFS=/ read -ra parts <<< "$name"
+    (( ${#parts[@]} >= 1 && ${#parts[@]} <= 8 )) || return 1
+    for part in "${parts[@]}"; do
+        git_workspace_name_component_valid "$part" || return 1
+    done
     return 0
+}
+
+git_workspace_names_conflict() {
+    local left="$1"
+    local right="$2"
+    [[ "$left" == "$right" || "$left" == "$right"/* || "$right" == "$left"/* ]]
 }
 
 git_workspace_url_valid() {
     local url="$1"
     [[ "$url" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)+$ ]]
+}
+
+git_workspace_shorthand_valid() {
+    local spec="$1"
+    local owner repo
+    [[ -n "$spec" && "$spec" != /* && "$spec" != */ && "$spec" != *//* ]] || return 1
+    [[ "$spec" == */* ]] || return 1
+    owner="${spec%%/*}"
+    repo="${spec#*/}"
+    [[ "$repo" != */* ]] || return 1
+    repo="${repo%.git}"
+    git_workspace_name_component_valid "$owner" || return 1
+    git_workspace_name_component_valid "$repo" || return 1
+}
+
+git_workspace_expand_shorthand() {
+    printf 'https://github.com/%s\n' "$1"
+}
+
+git_workspace_name_from_shorthand() {
+    local spec="$1"
+    spec="${spec%.git}"
+    printf '%s\n' "$spec"
 }
 
 git_workspace_name_from_url() {
@@ -1070,7 +1113,7 @@ git_workspace_name_from_url() {
 }
 
 parse_git_workspaces() {
-    local raw line name url
+    local raw line name url existing
     local -A seen=()
     local lineno=0
 
@@ -1092,6 +1135,8 @@ parse_git_workspaces() {
             name="${name%"${name##*[![:space:]]}"}"
             url="${url#"${url%%[![:space:]]*}"}"
             url="${url%"${url##*[![:space:]]}"}"
+        elif git_workspace_shorthand_valid "$line"; then
+            url="$line"
         else
             printf 'GIT_WORKSPACES line %s is missing a URL\n' "$lineno" >&2
             return 1
@@ -1100,7 +1145,12 @@ parse_git_workspaces() {
         while [[ "$url" == */ ]]; do
             url="${url%/}"
         done
-        if ! git_workspace_url_valid "$url"; then
+        if git_workspace_shorthand_valid "$url"; then
+            if [[ -z "$name" ]]; then
+                name="$(git_workspace_name_from_shorthand "$url")"
+            fi
+            url="$(git_workspace_expand_shorthand "$url")"
+        elif ! git_workspace_url_valid "$url"; then
             printf 'GIT_WORKSPACES URL is invalid: %s\n' "$url" >&2
             return 1
         fi
@@ -1115,6 +1165,12 @@ parse_git_workspaces() {
             printf 'GIT_WORKSPACES has a duplicate name: %s\n' "$name" >&2
             return 1
         fi
+        for existing in "${!seen[@]}"; do
+            if git_workspace_names_conflict "$existing" "$name"; then
+                printf 'GIT_WORKSPACES name conflicts with %s: %s\n' "$existing" "$name" >&2
+                return 1
+            fi
+        done
         seen[$name]=1
         printf '%s\t%s\n' "$name" "$url"
     done <<< "${GIT_WORKSPACES:-}"
@@ -1156,8 +1212,8 @@ clone_git_workspace() {
         return 0
     fi
 
-    if ! mkdir -p -- "$(workspace_root)"; then
-        warn "Skipping git workspace ${name}: could not create $(workspace_root)"
+    if ! mkdir -p -- "$(dirname -- "$dest")"; then
+        warn "Skipping git workspace ${name}: could not create $(dirname -- "$dest")"
         return 0
     fi
 

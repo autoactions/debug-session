@@ -255,7 +255,10 @@ jobs:
           Invoke-Expression $windowsScript.Substring($start, $end - $start)
           $root = Join-Path $env:USERPROFILE 'workspaces'
           foreach ($workspace in @(Get-GitWorkspaces)) {
-            $dest = Join-Path $root $workspace.Name
+            $dest = $root
+            foreach ($part in $workspace.Name.Split('/')) {
+              $dest = Join-Path $dest $part
+            }
             if (-not (Test-Path -LiteralPath (Join-Path $dest '.git'))) {
               throw "git workspace missing: $dest"
             }

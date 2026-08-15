@@ -1671,22 +1671,88 @@ function Get-GitWorkspaceRoot {
     return (Join-Path $env:USERPROFILE 'workspaces')
 }
 
-function Test-GitWorkspaceNameValid {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+function Test-GitWorkspaceNameComponentValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Part)
 
-    if ($Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') {
+    if ($Part -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') {
         return $false
     }
-    if ($Name -eq '.' -or $Name -eq '..') {
+    if ($Part -eq '.' -or $Part -eq '..') {
         return $false
     }
     return $true
+}
+
+function Test-GitWorkspaceNameValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $false
+    }
+    if ($Name.StartsWith('/') -or $Name.EndsWith('/') -or $Name.Contains('//')) {
+        return $false
+    }
+    $parts = @($Name.Split('/'))
+    if ($parts.Count -lt 1 -or $parts.Count -gt 8) {
+        return $false
+    }
+    foreach ($part in $parts) {
+        if (-not (Test-GitWorkspaceNameComponentValid -Part $part)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-GitWorkspaceNamesConflict {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    return ($Left -eq $Right -or $Left.StartsWith("$Right/") -or $Right.StartsWith("$Left/"))
 }
 
 function Test-GitWorkspaceUrlValid {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Url)
 
     return [bool]($Url -match '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)+$')
+}
+
+function Test-GitWorkspaceShorthandValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Spec)
+
+    if ([string]::IsNullOrWhiteSpace($Spec)) {
+        return $false
+    }
+    if ($Spec.StartsWith('/') -or $Spec.EndsWith('/') -or $Spec.Contains('//') -or -not $Spec.Contains('/')) {
+        return $false
+    }
+    $parts = @($Spec.Split('/'))
+    if ($parts.Count -ne 2) {
+        return $false
+    }
+    $repo = $parts[1]
+    if ($repo.EndsWith('.git')) {
+        $repo = $repo.Substring(0, $repo.Length - 4)
+    }
+    return (Test-GitWorkspaceNameComponentValid -Part $parts[0]) -and
+        (Test-GitWorkspaceNameComponentValid -Part $repo)
+}
+
+function ConvertTo-GitWorkspaceUrlFromShorthand {
+    param([Parameter(Mandatory = $true)][string]$Spec)
+
+    return "https://github.com/$Spec"
+}
+
+function ConvertTo-GitWorkspaceNameFromShorthand {
+    param([Parameter(Mandatory = $true)][string]$Spec)
+
+    if ($Spec.EndsWith('.git')) {
+        return $Spec.Substring(0, $Spec.Length - 4)
+    }
+    return $Spec
 }
 
 function ConvertTo-GitWorkspaceNameFromUrl {
@@ -1724,12 +1790,19 @@ function Get-GitWorkspaces {
             $separator = $line.IndexOf('=')
             $name = $line.Substring(0, $separator).Trim()
             $url = $line.Substring($separator + 1).Trim()
+        } elseif (Test-GitWorkspaceShorthandValid -Spec $line) {
+            $url = $line
         } else {
             throw "GIT_WORKSPACES line $lineno is missing a URL"
         }
 
         $url = $url.TrimEnd('/')
-        if (-not (Test-GitWorkspaceUrlValid -Url $url)) {
+        if (Test-GitWorkspaceShorthandValid -Spec $url) {
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = ConvertTo-GitWorkspaceNameFromShorthand -Spec $url
+            }
+            $url = ConvertTo-GitWorkspaceUrlFromShorthand -Spec $url
+        } elseif (-not (Test-GitWorkspaceUrlValid -Url $url)) {
             throw "GIT_WORKSPACES URL is invalid: $url"
         }
         if ([string]::IsNullOrWhiteSpace($name)) {
@@ -1740,6 +1813,11 @@ function Get-GitWorkspaces {
         }
         if ($seen.ContainsKey($name)) {
             throw "GIT_WORKSPACES has a duplicate name: $name"
+        }
+        foreach ($existing in @($seen.Keys)) {
+            if (Test-GitWorkspaceNamesConflict -Left $existing -Right $name) {
+                throw "GIT_WORKSPACES name conflicts with ${existing}: $name"
+            }
         }
         $seen[$name] = $true
         $workspaces.Add([pscustomobject]@{ Name = $name; Url = $url })
@@ -1768,7 +1846,10 @@ function Add-GitWorkspace {
         [Parameter(Mandatory = $true)][string]$Url
     )
 
-    $dest = Join-Path (Get-GitWorkspaceRoot) $Name
+    $dest = Get-GitWorkspaceRoot
+    foreach ($part in $Name.Split('/')) {
+        $dest = Join-Path $dest $part
+    }
     if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
         Write-Output "[debug-session] git workspace already present: $dest"
         return
@@ -1778,10 +1859,11 @@ function Add-GitWorkspace {
         return
     }
 
+    $parent = Split-Path -Parent $dest
     try {
-        New-Item -Path (Get-GitWorkspaceRoot) -ItemType Directory -Force | Out-Null
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
     } catch {
-        Write-Warning "Skipping git workspace ${Name}: could not create $(Get-GitWorkspaceRoot)"
+        Write-Warning "Skipping git workspace ${Name}: could not create $parent"
         return
     }
 

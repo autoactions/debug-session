@@ -41,9 +41,15 @@ expect_validate_ok $'my-app = https://github.com/org/proj-c \n'
 expect_validate_ok $'https://github.com/org/proj-a\r\nhttps://github.com/org/proj-b'
 expect_validate_ok 'https://github.com/org/proj-a/'
 expect_validate_ok 'https://gitlab.example.com:8443/group/sub/repo.git'
+expect_validate_ok 'org/priv'
+expect_validate_ok 'org/priv.git'
+expect_validate_ok 'my-app=org/priv'
+expect_validate_ok 'foo/bar=https://github.com/org/proj'
 
 expect_validate_fail $'https://github.com/org/a\nhttps://github.com/other/a.git' 'duplicate name'
 expect_validate_fail $'app=https://github.com/org/a\napp=https://github.com/org/b' 'duplicate name'
+expect_validate_fail $'org/priv\norg/priv.git' 'duplicate name'
+expect_validate_fail $'org=https://github.com/acme/org\norg/priv' 'conflicts'
 expect_validate_fail 'http://github.com/org/proj' 'URL is invalid'
 expect_validate_fail 'git@github.com:org/proj.git' 'missing a URL'
 expect_validate_fail 'ssh://git@github.com/org/proj.git' 'URL is invalid'
@@ -54,15 +60,17 @@ expect_validate_fail 'https://github.com/' 'URL is invalid'
 expect_validate_fail 'https://github.com' 'URL is invalid'
 expect_validate_fail '../evil=https://github.com/org/proj' 'name is invalid'
 expect_validate_fail '.=https://github.com/org/proj' 'name is invalid'
-expect_validate_fail 'foo/bar=https://github.com/org/proj' 'name is invalid'
+expect_validate_fail 'org/../priv' 'missing a URL'
+expect_validate_fail 'org/priv/extra' 'missing a URL'
 expect_validate_fail 'my-app=' 'URL is invalid'
 expect_validate_fail 'just-a-name' 'missing a URL'
 
-GIT_WORKSPACES=$'# keep\nhttps://github.com/org/proj-a.git\nmy-app=https://github.com/org/proj-c'
+GIT_WORKSPACES=$'# keep\nhttps://github.com/org/proj-a.git\nmy-app=https://github.com/org/proj-c\norg/priv'
 mapfile -t parsed < <(parse_git_workspaces)
-(( ${#parsed[@]} == 2 )) || fail "parsed ${#parsed[@]} workspaces, expected 2"
+(( ${#parsed[@]} == 3 )) || fail "parsed ${#parsed[@]} workspaces, expected 3"
 [[ "${parsed[0]}" == $'proj-a\thttps://github.com/org/proj-a.git' ]] || fail "first workspace was ${parsed[0]}"
 [[ "${parsed[1]}" == $'my-app\thttps://github.com/org/proj-c' ]] || fail "second workspace was ${parsed[1]}"
+[[ "${parsed[2]}" == $'org/priv\thttps://github.com/org/priv' ]] || fail "shorthand workspace was ${parsed[2]}"
 
 [[ "$(git_workspace_name_from_url 'https://github.com/org/proj-b.git')" == 'proj-b' ]] ||
     fail 'name from URL did not strip .git'
@@ -119,11 +127,14 @@ GIT_STUB_LOG="$stub_dir/git.log"
 export GIT_STUB_LOG
 : >"$GIT_STUB_LOG"
 
-GIT_WORKSPACES=$'https://github.com/org/proj-a\nmy-app=https://github.com/org/proj-c'
+GIT_WORKSPACES=$'https://github.com/org/proj-a\nmy-app=https://github.com/org/proj-c\norg/priv'
 export GIT_WORKSPACES
 enable_git_workspaces || fail 'enable_git_workspaces failed for valid public repos'
 [[ -d "$home/workspaces/proj-a/.git" ]] || fail 'proj-a was not cloned'
 [[ -d "$home/workspaces/my-app/.git" ]] || fail 'my-app was not cloned'
+[[ -d "$home/workspaces/org/priv/.git" ]] || fail 'org/priv was not cloned'
+[[ "$(cat "$home/workspaces/org/priv/.git/stub-url")" == 'https://github.com/org/priv' ]] ||
+    fail 'org/priv was cloned from the wrong URL'
 [[ "$(cat "$home/workspaces/proj-a/.git/stub-url")" == 'https://github.com/org/proj-a' ]] ||
     fail 'proj-a was cloned from the wrong URL'
 grep -Fq 'clone --depth=1 -- https://github.com/org/proj-a' "$GIT_STUB_LOG" ||
