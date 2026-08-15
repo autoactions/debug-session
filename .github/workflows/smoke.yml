@@ -58,6 +58,8 @@ jobs:
           command -v grok
           command -v zsh
           test -d "$HOME/.oh-my-zsh"
+          test -f "$HOME/.hushlogin"
+          grep -Fq 'skip_global_compinit' "$HOME/.zshenv"
       - name: Verify Linux rclone mounts
         run: |
           if [ -z "${RCLONE_CONFIG:-}" ]; then

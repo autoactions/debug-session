@@ -95,6 +95,17 @@ rdp_listener_line="$(grep -nF 'assert_private_listener 3389' "$linux_script" | c
 [[ -n "$ready_line" && -n "$rdp_listener_line" && "$ready_line" -lt "$rdp_listener_line" ]] ||
     fail 'Linux does not announce Core Session ready before verifying the RDP listener'
 
+# shellcheck disable=SC2016
+grep -Fq 'touch "$HOME/.hushlogin"' "$linux_script" ||
+    fail 'Linux does not silence the Ubuntu MOTD for the session user'
+# shellcheck disable=SC2016
+hush_line="$(grep -nF 'touch "$HOME/.hushlogin"' "$linux_script" | cut -d: -f1)"
+[[ -n "$hush_line" && -n "$ready_line" && "$hush_line" -lt "$ready_line" ]] ||
+    fail 'Linux does not create ~/.hushlogin before announcing Core Session ready'
+
+grep -Fq 'skip_global_compinit=1' "$linux_script" ||
+    fail 'Linux does not skip Ubuntu global zsh compinit before Oh My Zsh'
+
 grep -Fq '/usr/local/bin/stop-session' "$linux_script" ||
     fail 'Linux does not install the stop-session command on PATH'
 if grep -Fq 'STOP_SESSION_HERE' "$linux_script"; then

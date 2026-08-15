@@ -332,6 +332,7 @@ enable_core_session() {
     local session_user
     session_user="$(id -un)"
     printf '%s:%s\n' "$session_user" "$SESSION_PASSWORD" | sudo chpasswd
+    touch "$HOME/.hushlogin"
     printf 'PasswordAuthentication yes\nPermitRootLogin no\nListenAddress %s\n' "$tailscale_ip" |
         sudo tee /etc/ssh/sshd_config.d/00-debug-session.conf >/dev/null
     sudo install -d -o root -g root -m 0755 /run/sshd
@@ -420,6 +421,10 @@ install_oh_my_zsh() {
     if ! grep -Fq 'ZSH_DISABLE_COMPFIX' "$HOME/.zshrc"; then
         printf '%s\n' 'ZSH_DISABLE_COMPFIX=true' | cat - "$HOME/.zshrc" >"$HOME/.zshrc.debug-session" || return
         mv "$HOME/.zshrc.debug-session" "$HOME/.zshrc" || return
+    fi
+    # /etc/zsh/zshrc runs compinit before ~/.zshrc; this must be in ~/.zshenv.
+    if [[ ! -f "$HOME/.zshenv" ]] || ! grep -Fq 'skip_global_compinit' "$HOME/.zshenv"; then
+        printf '%s\n' 'skip_global_compinit=1' >>"$HOME/.zshenv" || return
     fi
 
     local zsh_path
