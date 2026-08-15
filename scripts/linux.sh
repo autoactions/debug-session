@@ -96,6 +96,27 @@ core_package_present() {
     command -v "$1" >/dev/null 2>&1
 }
 
+ensure_zsh_login_shell() {
+    if ! command -v zsh >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zsh || return 1
+    fi
+
+    local zsh_path
+    zsh_path="$(command -v zsh)" || return 1
+    sudo chsh -s "$zsh_path" "$(id -un)"
+
+    # A missing ~/.zshrc makes interactive zsh run zsh-newuser-install.
+    if [[ ! -f "$HOME/.zshrc" ]]; then
+        printf '%s\n' '# debug-session zsh login shell' >"$HOME/.zshrc" || return 1
+    fi
+    # /etc/zsh/zshrc runs compinit before ~/.zshrc and prompts on
+    # group-writable completion dirs (common on GitHub-hosted runners).
+    if [[ ! -f "$HOME/.zshenv" ]] || ! grep -Fq 'skip_global_compinit' "$HOME/.zshenv"; then
+        printf '%s\n' 'skip_global_compinit=1' >>"$HOME/.zshenv" || return 1
+    fi
+}
+
 ensure_core_packages() {
     local need_sshd=0
     local need_tailscale=0
@@ -333,6 +354,7 @@ enable_core_session() {
     session_user="$(id -un)"
     printf '%s:%s\n' "$session_user" "$SESSION_PASSWORD" | sudo chpasswd
     touch "$HOME/.hushlogin"
+    ensure_zsh_login_shell
     printf 'PasswordAuthentication yes\nPermitRootLogin no\nListenAddress %s\n' "$tailscale_ip" |
         sudo tee /etc/ssh/sshd_config.d/00-debug-session.conf >/dev/null
     sudo install -d -o root -g root -m 0755 /run/sshd
@@ -355,6 +377,10 @@ touch "$HOME/STOP_SESSION"
 EOF
     sudo install -m 0755 "$stop_session" /usr/local/bin/stop-session
     rm -f -- "$stop_session"
+
+    if [[ "$SESSION_PROFILE" == developer ]]; then
+        install_oh_my_zsh || warn 'Oh My Zsh is unavailable; zsh login remains without it'
+    fi
 
     log "Linux $ACCESS_PROFILE Core Session ready; Developer Profile provisioning may continue"
     printf 'SSH: %s@%s\n' "$session_user" "$tailscale_ip"
@@ -426,10 +452,6 @@ install_oh_my_zsh() {
     if [[ ! -f "$HOME/.zshenv" ]] || ! grep -Fq 'skip_global_compinit' "$HOME/.zshenv"; then
         printf '%s\n' 'skip_global_compinit=1' >>"$HOME/.zshenv" || return
     fi
-
-    local zsh_path
-    zsh_path="$(command -v zsh)" || return
-    sudo chsh -s "$zsh_path" "$(id -un)"
 }
 
 install_developer_profile() {

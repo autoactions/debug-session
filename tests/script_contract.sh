@@ -103,8 +103,27 @@ hush_line="$(grep -nF 'touch "$HOME/.hushlogin"' "$linux_script" | cut -d: -f1)"
 [[ -n "$hush_line" && -n "$ready_line" && "$hush_line" -lt "$ready_line" ]] ||
     fail 'Linux does not create ~/.hushlogin before announcing Core Session ready'
 
+# shellcheck disable=SC2016
+grep -Fq 'sudo chsh -s "$zsh_path" "$(id -un)"' "$linux_script" ||
+    fail 'Linux does not set zsh as the session login shell'
+zsh_shell_line="$(grep -nE '^[[:space:]]+ensure_zsh_login_shell$' "$linux_script" | head -n1 | cut -d: -f1)"
+[[ -n "$zsh_shell_line" && -n "$ready_line" && "$zsh_shell_line" -lt "$ready_line" ]] ||
+    fail 'Linux does not set zsh as the login shell before announcing Core Session ready'
+if awk '/^install_oh_my_zsh\(\)/,/^}/' "$linux_script" | grep -Fq 'chsh'; then
+    fail 'Linux still ties the login shell change to Oh My Zsh installation'
+fi
+# shellcheck disable=SC2016
+grep -Fq 'printf '\''%s\n'\'' '\''# debug-session zsh login shell'\'' >"$HOME/.zshrc"' "$linux_script" ||
+    fail 'Linux does not create ~/.zshrc before the first zsh login'
+
 grep -Fq 'skip_global_compinit=1' "$linux_script" ||
     fail 'Linux does not skip Ubuntu global zsh compinit before Oh My Zsh'
+if ! awk '/^ensure_zsh_login_shell\(\)/,/^}/' "$linux_script" | grep -Fq 'skip_global_compinit=1'; then
+    fail 'Linux does not skip Ubuntu global zsh compinit before the first zsh login'
+fi
+omz_line="$(grep -nE '^[[:space:]]+install_oh_my_zsh( |$|\|\|)' "$linux_script" | head -n1 | cut -d: -f1)"
+[[ -n "$omz_line" && -n "$ready_line" && "$omz_line" -lt "$ready_line" ]] ||
+    fail 'Linux does not install Oh My Zsh before announcing Core Session ready'
 
 grep -Fq '/usr/local/bin/stop-session' "$linux_script" ||
     fail 'Linux does not install the stop-session command on PATH'
