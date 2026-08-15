@@ -495,7 +495,7 @@ rclone_config_path() {
 }
 
 rclone_cloud_root() {
-    printf '%s/cloud' "$HOME"
+    printf '%s/rclone' "$HOME"
 }
 
 rclone_log_dir() {
@@ -638,7 +638,7 @@ provision_rclone_mounts() {
         fi
         if mount_rclone_remote "$remote"; then
             mounted=1
-            log "rclone mount ready: $HOME/cloud/$remote"
+            log "rclone mount ready: $(rclone_cloud_root)/$remote"
         else
             warn "rclone mount failed for $remote"
         fi

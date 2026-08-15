@@ -136,6 +136,9 @@ if ($windowsScript -match 'Desktop\\STOP_SESSION') {
 if ($windowsScript -notmatch 'Enable-RcloneMounts') {
     throw 'Windows does not provision rclone mounts'
 }
+if ($windowsScript -notmatch "Join-Path \$env:USERPROFILE 'rclone'") {
+    throw 'Windows does not mount remotes under the user rclone directory'
+}
 if ($windowsScript -notmatch 'Initialize-RcloneWindowsMountPoint') {
     throw 'Windows does not prepare a WinFsp-compatible mount point'
 }

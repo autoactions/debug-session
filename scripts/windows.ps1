@@ -832,7 +832,7 @@ function Get-RcloneConfigPath {
 }
 
 function Get-RcloneCloudRoot {
-    return (Join-Path $env:USERPROFILE 'cloud')
+    return (Join-Path $env:USERPROFILE 'rclone')
 }
 
 function Get-RcloneLogDirectory {

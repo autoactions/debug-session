@@ -25,6 +25,14 @@ RCLONE_CONFIG='placeholder'
 rclone_config_present || fail 'rclone_config_present was false when RCLONE_CONFIG was set'
 unset RCLONE_CONFIG
 
+home="$(mktemp -d)"
+trap 'rm -rf -- "$home"' EXIT
+HOME="$home"
+export HOME
+
+[[ "$(rclone_cloud_root)" == "$HOME/rclone" ]] ||
+    fail "rclone mount root is $(rclone_cloud_root), expected $HOME/rclone"
+
 rclone_remote_mountable 'drive' || fail 'safe remote name drive was rejected'
 rclone_remote_mountable 'crypt-data' || fail 'safe remote name crypt-data was rejected'
 rclone_remote_mountable '' && fail 'empty remote name was accepted'
@@ -32,11 +40,6 @@ rclone_remote_mountable '.' && fail 'remote name . was accepted'
 rclone_remote_mountable '..' && fail 'remote name .. was accepted'
 rclone_remote_mountable 'bad/name' && fail 'remote name with slash was accepted'
 rclone_remote_mountable 'bad\name' && fail 'remote name with backslash was accepted'
-
-home="$(mktemp -d)"
-trap 'rm -rf -- "$home"' EXIT
-HOME="$home"
-export HOME
 
 RCLONE_CONFIG="$(printf '%s\n' \
     '[drive]' \
