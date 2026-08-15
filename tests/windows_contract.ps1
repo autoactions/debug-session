@@ -57,6 +57,62 @@ try {
     }
 }
 
+$env:RCLONE_HOME_LINKS = @"
+# comment
+.agents/=drive/dotfiles/agents/
+.grok/=drive/dotfiles/grok/
+"@
+Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
+    -Candidate '12345678'
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
+$env:RCLONE_HOME_LINKS = ".agents/=drive/a/`n.agents/=drive/b/"
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a duplicate RCLONE_HOME_LINKS target'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a duplicate RCLONE_HOME_LINKS target') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*duplicate target*') {
+        throw "Windows validation returned an unexpected home-link error: $_"
+    }
+}
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
+$env:RCLONE_HOME_LINKS = ".grok/sessions/=koofr/Home/.grok/sessions/`n.grok/config.toml=koofr/Home/.grok/config.toml"
+Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
+    -Candidate '12345678'
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
+$env:RCLONE_HOME_LINKS = ".agents/=koofr/Home/.agents"
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a directory marker mismatch'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a directory marker mismatch') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*directory marker mismatch*') {
+        throw "Windows validation returned an unexpected marker-mismatch error: $_"
+    }
+}
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
+$env:RCLONE_HOME_LINKS = ".grok/=drive/g/`n.grok/sessions/=drive/g/sessions/"
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a conflicting RCLONE_HOME_LINKS target'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a conflicting RCLONE_HOME_LINKS target') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*conflicts*') {
+        throw "Windows validation returned an unexpected home-link conflict error: $_"
+    }
+}
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
 Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
     -Candidate '12345678'
 
@@ -160,16 +216,26 @@ if ($windowsScript -match '--allow-other') {
 if ($windowsScript -notmatch 'Close-RcloneMounts') {
     throw 'Windows does not clean up rclone mounts'
 }
+if ($windowsScript -notmatch 'Enable-RcloneHomeLinks') {
+    throw 'Windows does not provision rclone home links'
+}
+if ($windowsScript -match 'home links are not implemented on Windows') {
+    throw 'Windows still no-ops rclone home links'
+}
+if ($windowsScript -notmatch 'Wait-RcloneExit') {
+    throw 'Windows does not wait for rclone VFS write-back before deleting the cache'
+}
 
 $enableCore = $windowsScript.LastIndexOf('Enter-CoreSession')
 $enableRclone = $windowsScript.LastIndexOf('Enable-RcloneMounts')
+$enableLinks = $windowsScript.LastIndexOf('Enable-RcloneHomeLinks')
 $enableDeveloper = $windowsScript.LastIndexOf('Install-DeveloperProfile')
 $enableWsl = $windowsScript.LastIndexOf('Initialize-WslUbuntu')
-if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableDeveloper -lt 0 -or $enableWsl -lt 0) {
-    throw 'Windows session startup is missing core, rclone, developer, or WSL steps'
+if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableLinks -lt 0 -or $enableDeveloper -lt 0 -or $enableWsl -lt 0) {
+    throw 'Windows session startup is missing core, rclone, home links, developer, or WSL steps'
 }
-if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableDeveloper -and $enableRclone -lt $enableWsl)) {
-    throw 'Windows does not mount rclone after Core Session ready and before Developer/WSL'
+if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableLinks -and $enableLinks -lt $enableDeveloper -and $enableLinks -lt $enableWsl)) {
+    throw 'Windows does not apply home links after rclone mounts and before Developer/WSL'
 }
 if ($windowsScript -notmatch '\$env:WSL_UTF8 = ''1''') {
     throw 'Windows does not force UTF-8 WSL CLI output'
@@ -269,6 +335,158 @@ $closeRclone = $windowsScript.LastIndexOf('Close-RcloneMounts')
 $logout = $windowsScript.LastIndexOf('$tailscale logout')
 if ($closeRclone -lt 0 -or $logout -lt 0 -or $closeRclone -ge $logout) {
     throw 'Windows does not clean up rclone mounts before Tailscale logout'
+}
+
+$closeFn = $windowsScript.IndexOf('function Close-RcloneMounts')
+$waitRclone = $windowsScript.IndexOf('Wait-RcloneExit', $closeFn)
+$forceKill = $windowsScript.IndexOf('Stop-Process -Force', $closeFn)
+$cacheRemove = $windowsScript.IndexOf("Join-Path `$env:LOCALAPPDATA 'rclone'", $closeFn)
+if ($closeFn -lt 0 -or $waitRclone -lt 0 -or $forceKill -lt 0 -or $cacheRemove -lt 0) {
+    throw 'Windows cleanup is missing VFS write-back wait, force-kill fallback, or cache removal'
+}
+if (-not ($waitRclone -lt $forceKill -and $forceKill -lt $cacheRemove)) {
+    throw 'Windows does not wait for rclone to exit before force-killing it and deleting the VFS cache'
+}
+
+$linkStart = $windowsScript.IndexOf('function Test-RcloneHomeLinkComponentValid')
+$linkEnd = $windowsScript.IndexOf('function Add-RcloneHomeLink')
+if ($linkStart -lt 0 -or $linkEnd -lt 0 -or $linkEnd -le $linkStart) {
+    throw 'Windows is missing rclone home link helper functions'
+}
+Invoke-Expression $windowsScript.Substring($linkStart, $linkEnd - $linkStart)
+
+if (-not (Test-RcloneHomeLinkTargetValid -Target '.agents')) {
+    throw 'Windows rejected a valid home link target'
+}
+if (-not (Test-RcloneHomeLinkTargetValid -Target '.grok/sessions')) {
+    throw 'Windows rejected a valid nested home link target'
+}
+if (Test-RcloneHomeLinkTargetValid -Target 'rclone') {
+    throw 'Windows accepted rclone as a home link target'
+}
+if (Test-RcloneHomeLinkTargetValid -Target 'rclone/foo') {
+    throw 'Windows accepted rclone as a nested home link target'
+}
+if (Test-RcloneHomeLinkTargetValid -Target '.grok/../sessions') {
+    throw 'Windows accepted a nested target containing ..'
+}
+if (Test-RcloneHomeLinkSourceValid -Source 'drive/../foo') {
+    throw 'Windows accepted a source path containing ..'
+}
+
+$env:RCLONE_HOME_LINKS = @"
+# keep
+.agents/=drive/dotfiles/agents/
+.grok/config.toml=drive/grok/config.toml
+"@
+$parsed = @(Get-RcloneHomeLinks)
+if ($parsed.Count -ne 2) {
+    throw "Windows parsed $($parsed.Count) home links, expected 2"
+}
+if ($parsed[0].Target -ne '.agents' -or $parsed[0].Source -ne 'drive/dotfiles/agents' -or $parsed[0].Kind -ne 'dir') {
+    throw "Windows first home link was $($parsed[0].Target)=$($parsed[0].Source) kind=$($parsed[0].Kind)"
+}
+if ($parsed[1].Target -ne '.grok/config.toml' -or $parsed[1].Kind -ne 'file') {
+    throw "Windows file home link was $($parsed[1].Target) kind=$($parsed[1].Kind)"
+}
+Remove-Item Env:RCLONE_HOME_LINKS -ErrorAction SilentlyContinue
+
+$scratchRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('debug-session-home-links-' + [guid]::NewGuid().ToString('N'))
+New-Item -Path $scratchRoot -ItemType Directory | Out-Null
+$previousProfile = $env:USERPROFILE
+try {
+    $env:USERPROFILE = $scratchRoot
+    $nestedRel = ConvertTo-RcloneHomeLinkRelativeTarget -Source 'koofr/Home/.grok/sessions' `
+        -Destination (Join-Path (Join-Path $scratchRoot '.grok') 'sessions')
+    if ($nestedRel -ne '..\rclone\koofr\Home\.grok\sessions') {
+        throw "ConvertTo-RcloneHomeLinkRelativeTarget returned $nestedRel"
+    }
+    $topRel = ConvertTo-RcloneHomeLinkRelativeTarget -Source 'drive/dotfiles/agents' `
+        -Destination (Join-Path $scratchRoot '.agents')
+    if ($topRel -ne 'rclone\drive\dotfiles\agents') {
+        throw "ConvertTo-RcloneHomeLinkRelativeTarget top-level returned $topRel"
+    }
+    foreach ($rel in @(
+            'rclone\drive\dotfiles\agents',
+            'rclone\drive\other',
+            'rclone\drive\empty',
+            'rclone\koofr\Home\.grok\sessions'
+        )) {
+        New-Item -Path (Join-Path $scratchRoot $rel) -ItemType Directory -Force | Out-Null
+    }
+    $dest = Join-Path $scratchRoot '.agents'
+    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
+        throw 'Install-HomeSymlink failed for a missing destination'
+    }
+    $created = Get-Item -LiteralPath $dest -Force
+    if ($created.LinkType -notin @('SymbolicLink', 'Junction')) {
+        throw "Install-HomeSymlink did not create a link: LinkType=$($created.LinkType)"
+    }
+    if (-not (Test-HomeLinkMatches -Item $created -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
+        throw "Install-HomeSymlink target was $(@($created.Target)[0])"
+    }
+    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
+        throw 'Install-HomeSymlink was not idempotent for the same target'
+    }
+    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\other')) {
+        throw 'Install-HomeSymlink did not replace a wrong symlink'
+    }
+    $empty = Join-Path $scratchRoot '.empty'
+    New-Item -Path $empty -ItemType Directory | Out-Null
+    if (-not (Install-HomeSymlink -Destination $empty -RelativeTarget 'rclone\drive\empty')) {
+        throw 'Install-HomeSymlink did not replace an empty directory'
+    }
+    $full = Join-Path $scratchRoot '.full'
+    New-Item -Path (Join-Path $full 'keep') -ItemType Directory -Force | Out-Null
+    if (Install-HomeSymlink -Destination $full -RelativeTarget 'rclone\drive\full') {
+        throw 'Install-HomeSymlink replaced a non-empty directory'
+    }
+    $file = Join-Path $scratchRoot '.file'
+    Set-Content -LiteralPath $file -Value 'x'
+    if (Install-HomeSymlink -Destination $file -RelativeTarget 'rclone\drive\file') {
+        throw 'Install-HomeSymlink replaced a regular file'
+    }
+    $nestedParent = Join-Path $scratchRoot '.grok'
+    $nested = Join-Path $nestedParent 'sessions'
+    New-Item -Path $nestedParent -ItemType Directory -Force | Out-Null
+    if (-not (Install-HomeSymlink -Destination $nested -RelativeTarget '..\rclone\koofr\Home\.grok\sessions')) {
+        throw 'Install-HomeSymlink failed for a nested destination'
+    }
+    $nestedItem = Get-Item -LiteralPath $nested -Force
+    if ($nestedItem.LinkType -notin @('SymbolicLink', 'Junction')) {
+        throw "Install-HomeSymlink did not create a nested link: LinkType=$($nestedItem.LinkType)"
+    }
+    if (-not (Test-HomeLinkMatches -Item $nestedItem -Destination $nested -RelativeTarget '..\rclone\koofr\Home\.grok\sessions')) {
+        throw "Install-HomeSymlink nested target was $(@($nestedItem.Target)[0])"
+    }
+    $fileSource = Join-Path $scratchRoot 'rclone\koofr\Home\.grok\config.toml'
+    Ensure-RcloneHomeLinkSource -Path $fileSource -AsFile
+    $fileSourceItem = Get-Item -LiteralPath $fileSource -Force
+    if ($fileSourceItem.PSIsContainer) {
+        throw 'Ensure-RcloneHomeLinkSource created config.toml as a directory'
+    }
+    $authDir = Join-Path $scratchRoot 'rclone\koofr\Home\.grok\auth.json'
+    New-Item -Path $authDir -ItemType Directory -Force | Out-Null
+    Ensure-RcloneHomeLinkSource -Path $authDir -AsFile
+    $authItem = Get-Item -LiteralPath $authDir -Force
+    if ($authItem.PSIsContainer) {
+        throw 'Ensure-RcloneHomeLinkSource did not convert an empty auth.json directory into a file'
+    }
+    $fileDest = Join-Path $nestedParent 'config.toml'
+    if (-not (Install-HomeSymlink -Destination $fileDest -RelativeTarget '..\rclone\koofr\Home\.grok\config.toml' -AsFile)) {
+        throw 'Install-HomeSymlink failed for a file destination'
+    }
+    $fileLink = Get-Item -LiteralPath $fileDest -Force
+    if ($fileLink.LinkType -ne 'SymbolicLink') {
+        throw "Install-HomeSymlink did not create a file symlink: LinkType=$($fileLink.LinkType)"
+    }
+} finally {
+    $env:USERPROFILE = $previousProfile
+    Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($windowsScript -notmatch '(?s)function Get-RcloneWritebackWaitSeconds\s*\{\s*return 120') {
+    throw 'Windows rclone write-back wait is not 120 seconds'
 }
 
 Write-Output 'Windows input behavior: PASS'

@@ -60,6 +60,7 @@ validate_inputs() {
     }
 
     validate_session_password
+    validate_rclone_home_links
 }
 
 apt_prerequisites_present() {
@@ -672,6 +673,27 @@ unmount_rclone_path() {
         true
 }
 
+rclone_writeback_wait_seconds() {
+    printf '%s\n' '120'
+}
+
+rclone_process_running() {
+    pgrep -x rclone >/dev/null 2>&1
+}
+
+wait_for_rclone_exit() {
+    local timeout="$1"
+    local elapsed=0
+    while rclone_process_running; do
+        if (( elapsed >= timeout )); then
+            return 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 0
+}
+
 cleanup_rclone_mounts() {
     local root dir
     root="$(rclone_cloud_root)"
@@ -681,14 +703,318 @@ cleanup_rclone_mounts() {
             unmount_rclone_path "$dir"
         done
     fi
-    pkill -x rclone 2>/dev/null || true
+
+    if ! wait_for_rclone_exit "$(rclone_writeback_wait_seconds)"; then
+        warn 'rclone did not exit after unmount; unflushed VFS writes may be lost'
+        pkill -x rclone 2>/dev/null || true
+        wait_for_rclone_exit 5 || true
+    fi
+
     rm -f -- "$(rclone_config_path)"
     rm -rf -- "$HOME/.cache/rclone" "$(rclone_log_dir)"
+}
+
+rclone_home_links_present() {
+    [[ -n "${RCLONE_HOME_LINKS:-}" ]]
+}
+
+rclone_home_link_component_valid() {
+    local part="$1"
+    [[ "$part" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
+    [[ "$part" != '.' && "$part" != '..' ]] || return 1
+    return 0
+}
+
+rclone_home_link_target_valid() {
+    local target="$1"
+    local part
+    local -a parts
+    [[ -n "$target" ]] || return 1
+    [[ "$target" != /* && "$target" != *\\* && "$target" != *[[:space:]]* ]] || return 1
+    IFS=/ read -ra parts <<< "$target"
+    (( ${#parts[@]} >= 1 && ${#parts[@]} <= 8 )) || return 1
+    for part in "${parts[@]}"; do
+        rclone_home_link_component_valid "$part" || return 1
+    done
+    [[ "${parts[0]}" != 'rclone' ]] || return 1
+    return 0
+}
+
+rclone_home_link_targets_conflict() {
+    local left="$1"
+    local right="$2"
+    [[ "$left" == "$right" || "$left" == "$right"/* || "$right" == "$left"/* ]]
+}
+
+rclone_home_link_relative_target() {
+    local dest="$1"
+    local source="$2"
+    local dest_parent prefix='' suffix
+    local home="${HOME%/}"
+    local -a parts
+    local part
+    dest_parent="$(dirname -- "$dest")"
+    suffix="${dest_parent#"$home"}"
+    suffix="${suffix#/}"
+    if [[ -n "$suffix" ]]; then
+        IFS=/ read -ra parts <<< "$suffix"
+        for part in "${parts[@]}"; do
+            prefix="../$prefix"
+        done
+    fi
+    printf '%srclone/%s\n' "$prefix" "$source"
+}
+
+rclone_home_link_ancestors_are_local() {
+    local dest="$1"
+    local home="${HOME%/}"
+    local cursor
+    cursor="$(dirname -- "$dest")"
+    while [[ "$cursor" != "$home" && "$cursor" != '/' && "$cursor" != '.' ]]; do
+        if [[ -L "$cursor" || ! -d "$cursor" ]]; then
+            return 1
+        fi
+        cursor="$(dirname -- "$cursor")"
+    done
+    return 0
+}
+
+rclone_home_link_source_valid() {
+    local source="$1"
+    local part
+    local -a parts
+    [[ -n "$source" ]] || return 1
+    [[ "$source" != /* && "$source" != *\\* && "$source" != *[[:space:]]* ]] || return 1
+    IFS=/ read -ra parts <<< "$source"
+    (( ${#parts[@]} >= 1 )) || return 1
+    for part in "${parts[@]}"; do
+        [[ -n "$part" ]] || return 1
+        [[ "$part" != '.' && "$part" != '..' ]] || return 1
+    done
+    return 0
+}
+
+parse_rclone_home_links() {
+    local raw line target source existing kind target_dir source_dir
+    local -A seen=()
+    local lineno=0
+
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        lineno=$((lineno + 1))
+        line="${raw%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" != *=* ]]; then
+            printf 'RCLONE_HOME_LINKS line %s is missing =\n' "$lineno" >&2
+            return 1
+        fi
+        target="${line%%=*}"
+        source="${line#*=}"
+        target="${target#"${target%%[![:space:]]*}"}"
+        target="${target%"${target##*[![:space:]]}"}"
+        source="${source#"${source%%[![:space:]]*}"}"
+        source="${source%"${source##*[![:space:]]}"}"
+        target_dir=0
+        source_dir=0
+        [[ "$target" == */ ]] && target_dir=1
+        [[ "$source" == */ ]] && source_dir=1
+        while [[ "$target" == */ ]]; do
+            target="${target%/}"
+        done
+        while [[ "$source" == */ ]]; do
+            source="${source%/}"
+        done
+        if [[ -z "$source" ]]; then
+            printf 'RCLONE_HOME_LINKS source is invalid: %s\n' "$source" >&2
+            return 1
+        fi
+        if (( target_dir != source_dir )); then
+            printf 'RCLONE_HOME_LINKS directory marker mismatch: %s=%s\n' "$target" "$source" >&2
+            return 1
+        fi
+        if (( target_dir )); then
+            kind='dir'
+        else
+            kind='file'
+        fi
+        if ! rclone_home_link_target_valid "$target"; then
+            printf 'RCLONE_HOME_LINKS target is invalid: %s\n' "$target" >&2
+            return 1
+        fi
+        if ! rclone_home_link_source_valid "$source"; then
+            printf 'RCLONE_HOME_LINKS source is invalid: %s\n' "$source" >&2
+            return 1
+        fi
+        if [[ -n "${seen[$target]:-}" ]]; then
+            printf 'RCLONE_HOME_LINKS has a duplicate target: %s\n' "$target" >&2
+            return 1
+        fi
+        for existing in "${!seen[@]}"; do
+            if rclone_home_link_targets_conflict "$existing" "$target"; then
+                printf 'RCLONE_HOME_LINKS target conflicts with %s: %s\n' "$existing" "$target" >&2
+                return 1
+            fi
+        done
+        seen[$target]=1
+        printf '%s\t%s\t%s\n' "$target" "$source" "$kind"
+    done <<< "${RCLONE_HOME_LINKS:-}"
+}
+
+validate_rclone_home_links() {
+    if ! rclone_home_links_present; then
+        return 0
+    fi
+    parse_rclone_home_links >/dev/null
+}
+
+rclone_has_live_mounts() {
+    local root dir
+    root="$(rclone_cloud_root)"
+    [[ -d "$root" ]] || return 1
+    for dir in "$root"/*; do
+        [[ -d "$dir" ]] || continue
+        if mountpoint -q "$dir"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+directory_is_empty() {
+    local dest="$1"
+    local -a entries
+    local old
+    old="$(shopt -p nullglob dotglob)"
+    shopt -s nullglob dotglob
+    entries=("$dest"/*)
+    eval "$old"
+    (( ${#entries[@]} == 0 ))
+}
+
+ensure_rclone_home_link_source() {
+    local src_path="$1"
+    local as_file="$2"
+    local parent
+    parent="$(dirname -- "$src_path")"
+    mkdir -p -- "$parent" || return 1
+
+    if [[ -d "$src_path" && ! -L "$src_path" ]]; then
+        if [[ "$as_file" == 'file' ]] && directory_is_empty "$src_path"; then
+            rmdir -- "$src_path" || return 1
+            : >"$src_path" || return 1
+        fi
+        return 0
+    fi
+    if [[ -f "$src_path" ]]; then
+        return 0
+    fi
+    if [[ -e "$src_path" ]]; then
+        return 1
+    fi
+    if [[ "$as_file" == 'file' ]]; then
+        : >"$src_path"
+    else
+        mkdir -p -- "$src_path"
+    fi
+}
+
+install_home_symlink() {
+    local dest="$1"
+    local rel="$2"
+
+    if [[ -L "$dest" ]]; then
+        if [[ "$(readlink -- "$dest")" == "$rel" ]]; then
+            return 0
+        fi
+        rm -f -- "$dest" || return 1
+    elif [[ -d "$dest" ]]; then
+        if directory_is_empty "$dest"; then
+            rmdir -- "$dest" || return 1
+        else
+            return 1
+        fi
+    elif [[ -e "$dest" ]]; then
+        return 1
+    fi
+
+    ln -s -- "$rel" "$dest"
+}
+
+apply_rclone_home_link() {
+    local target="$1"
+    local source="$2"
+    local kind="${3:-dir}"
+    local dest rel src_path first parent
+    dest="$HOME/$target"
+    src_path="$HOME/rclone/$source"
+    rel="$(rclone_home_link_relative_target "$dest" "$source")"
+    first="${source%%/*}"
+    parent="$(dirname -- "$dest")"
+
+    if ! mountpoint -q "$(rclone_cloud_root)/$first"; then
+        warn "Skipping home link ${target}: rclone remote ${first} is not mounted"
+        return 0
+    fi
+    if ! ensure_rclone_home_link_source "$src_path" "$kind"; then
+        warn "Skipping home link ${target}: could not create ${src_path}"
+        return 0
+    fi
+    if [[ "$kind" == 'file' ]]; then
+        if [[ -d "$src_path" && ! -f "$src_path" ]]; then
+            warn "Skipping home link ${target}: source is a directory but the mapping is a file"
+            return 0
+        fi
+        if [[ ! -f "$src_path" ]]; then
+            warn "Skipping home link ${target}: source is not a file"
+            return 0
+        fi
+    elif [[ ! -d "$src_path" ]]; then
+        warn "Skipping home link ${target}: source is not a directory"
+        return 0
+    fi
+    if ! mkdir -p -- "$parent"; then
+        warn "Skipping home link ${target}: could not create parent ${parent}"
+        return 0
+    fi
+    if ! rclone_home_link_ancestors_are_local "$dest"; then
+        warn "Skipping home link ${target}: parent is not a local directory"
+        return 0
+    fi
+    if install_home_symlink "$dest" "$rel"; then
+        log "home link ready: ${dest} -> ${rel}"
+        return 0
+    fi
+    warn "Skipping home link ${target}: ${dest} already exists or could not be replaced"
+    return 0
+}
+
+enable_rclone_home_links() {
+    if ! rclone_home_links_present; then
+        log 'RCLONE_HOME_LINKS is empty; skipping home links'
+        return 0
+    fi
+    if ! rclone_has_live_mounts; then
+        warn 'RCLONE_HOME_LINKS is set but rclone mounts are unavailable; skipping home links'
+        return 0
+    fi
+
+    local target source kind
+    if ! parse_rclone_home_links >/dev/null; then
+        warn 'RCLONE_HOME_LINKS is invalid after validate; skipping home links'
+        return 0
+    fi
+    while IFS=$'\t' read -r target source kind; do
+        [[ -n "$target" ]] || continue
+        apply_rclone_home_link "$target" "$source" "$kind"
+    done < <(parse_rclone_home_links)
+    return 0
 }
 
 run_session() {
     enable_core_session
     enable_rclone_mounts
+    enable_rclone_home_links
     if [[ "$ACCESS_PROFILE" == full ]]; then
         enable_xfce_rdp || true
     fi

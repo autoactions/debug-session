@@ -34,6 +34,7 @@ jobs:
       TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
       TAILSCALE_TAGS: tag:debug-session
       RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+      RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}
     steps:
       - name: Set smoke deadline
         run: echo "SESSION_DEADLINE_EPOCH=$(($(date +%s) + 50 * 60))" >> "$GITHUB_ENV"
@@ -64,7 +65,7 @@ jobs:
             exit 0
           fi
           shopt -s nullglob
-          mounts=("$HOME"/cloud/*)
+          mounts=("$HOME"/rclone/*)
           (( ${#mounts[@]} > 0 )) || {
             echo 'RCLONE_CONFIG is set but no rclone mount points exist' >&2
             exit 1
@@ -75,6 +76,31 @@ jobs:
               exit 1
             }
           done
+      - name: Verify Linux rclone home links
+        run: |
+          if [ -z "${RCLONE_HOME_LINKS:-}" ]; then
+            echo 'RCLONE_HOME_LINKS is empty; skipping home link checks'
+            exit 0
+          fi
+          if [ -z "${RCLONE_CONFIG:-}" ]; then
+            echo 'RCLONE_HOME_LINKS is set but RCLONE_CONFIG is empty; remaps are skipped'
+            exit 0
+          fi
+          # shellcheck disable=SC1091
+          source scripts/linux.sh
+          while IFS=$'\t' read -r target source kind; do
+            [[ -n "$target" ]] || continue
+            dest="$HOME/$target"
+            rel="$(rclone_home_link_relative_target "$dest" "$source")"
+            [[ -L "$dest" ]] || {
+              echo "home link missing: $dest" >&2
+              exit 1
+            }
+            [[ "$(readlink -- "$dest")" == "$rel" ]] || {
+              echo "home link $dest points at $(readlink -- "$dest"), expected $rel" >&2
+              exit 1
+            }
+          done < <(parse_rclone_home_links)
       - name: Clean up Linux smoke session
         if: ${{ always() }}
         run: bash scripts/linux.sh cleanup
@@ -99,6 +125,7 @@ jobs:
       TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
       TAILSCALE_TAGS: tag:debug-session
       RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+      RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}
     steps:
       - name: Set smoke deadline
         shell: pwsh
@@ -141,7 +168,7 @@ jobs:
             Write-Output 'RCLONE_CONFIG is empty; skipping rclone mount checks'
             exit 0
           }
-          $root = Join-Path $env:USERPROFILE 'cloud'
+          $root = Join-Path $env:USERPROFILE 'rclone'
           $mounts = @()
           if (Test-Path -LiteralPath $root) {
             $mounts = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
@@ -153,6 +180,41 @@ jobs:
             $attrs = $mount.Attributes
             if (-not ($attrs -band [IO.FileAttributes]::ReparsePoint)) {
               throw "rclone mount is missing: $($mount.FullName)"
+            }
+          }
+      - name: Verify Windows rclone home links
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RCLONE_HOME_LINKS)) {
+            Write-Output 'RCLONE_HOME_LINKS is empty; skipping home link checks'
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RCLONE_CONFIG)) {
+            Write-Output 'RCLONE_HOME_LINKS is set but RCLONE_CONFIG is empty; remaps are skipped'
+            exit 0
+          }
+          $windowsScript = Get-Content -LiteralPath './scripts/windows.ps1' -Raw
+          $linkStart = $windowsScript.IndexOf('function Test-RcloneHomeLinkComponentValid')
+          $linkEnd = $windowsScript.IndexOf('function Add-RcloneHomeLink')
+          if ($linkStart -lt 0 -or $linkEnd -lt 0 -or $linkEnd -le $linkStart) {
+            throw 'Windows is missing rclone home link helper functions'
+          }
+          Invoke-Expression $windowsScript.Substring($linkStart, $linkEnd - $linkStart)
+          foreach ($link in @(Get-RcloneHomeLinks)) {
+            $dest = $env:USERPROFILE
+            foreach ($part in $link.Target.Split('/')) {
+              $dest = Join-Path $dest $part
+            }
+            $rel = ConvertTo-RcloneHomeLinkRelativeTarget -Source $link.Source -Destination $dest
+            if (-not (Test-Path -LiteralPath $dest)) {
+              throw "home link missing: $dest"
+            }
+            $item = Get-Item -LiteralPath $dest -Force
+            if ($item.LinkType -notin @('SymbolicLink', 'Junction')) {
+              throw "home link is not a reparse point: $dest (LinkType=$($item.LinkType))"
+            }
+            if (-not (Test-HomeLinkMatches -Item $item -Destination $dest -RelativeTarget $rel)) {
+              throw "home link $dest points at $(@($item.Target)[0]), expected $rel"
             }
           }
       - name: Clean up Windows smoke session

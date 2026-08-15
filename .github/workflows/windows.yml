@@ -33,6 +33,7 @@ jobs:
       TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
       TAILSCALE_TAGS: tag:debug-session
       RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+      RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}
     steps:
       - name: Set Debug Session deadline
         shell: pwsh

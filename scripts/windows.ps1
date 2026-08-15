@@ -50,6 +50,7 @@ function Get-ValidatedSessionInput {
     }
 
     $null = Assert-SessionPassword
+    Assert-RcloneHomeLinks
 
     return @{
         Deadline = $deadline
@@ -1157,9 +1158,37 @@ function Enable-RcloneMounts {
     }
 }
 
+function Get-RcloneWritebackWaitSeconds {
+    return 120
+}
+
+function Test-RcloneProcessRunning {
+    return [bool](Get-Process -Name rclone -ErrorAction SilentlyContinue)
+}
+
+function Wait-RcloneExit {
+    param([Parameter(Mandatory = $true)][int]$TimeoutSeconds)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-RcloneProcessRunning)) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return -not (Test-RcloneProcessRunning)
+}
+
 function Close-RcloneMounts {
-    Get-Process -Name rclone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
+    Get-Process -Name rclone -ErrorAction SilentlyContinue | ForEach-Object {
+        & taskkill.exe /PID $_.Id 2>$null | Out-Null
+    }
+    if (-not (Wait-RcloneExit -TimeoutSeconds (Get-RcloneWritebackWaitSeconds))) {
+        Write-Warning 'rclone did not exit after unmount; unflushed VFS writes may be lost'
+        Get-Process -Name rclone -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        $null = Wait-RcloneExit -TimeoutSeconds 5
+    }
 
     $configPath = Get-RcloneConfigPath
     if (Test-Path -LiteralPath $configPath) {
@@ -1178,10 +1207,466 @@ function Close-RcloneMounts {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
+function Test-RcloneHomeLinksPresent {
+    return -not [string]::IsNullOrWhiteSpace($env:RCLONE_HOME_LINKS)
+}
+
+function Test-RcloneHomeLinkComponentValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Part)
+
+    if ($Part -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') {
+        return $false
+    }
+    if ($Part -eq '.' -or $Part -eq '..') {
+        return $false
+    }
+    return $true
+}
+
+function Test-RcloneHomeLinkTargetValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Target)
+
+    if ([string]::IsNullOrWhiteSpace($Target)) {
+        return $false
+    }
+    if ($Target.StartsWith('/') -or $Target.Contains('\') -or $Target -match '\s') {
+        return $false
+    }
+    $parts = @($Target.Split('/'))
+    if ($parts.Count -lt 1 -or $parts.Count -gt 8) {
+        return $false
+    }
+    foreach ($part in $parts) {
+        if (-not (Test-RcloneHomeLinkComponentValid -Part $part)) {
+            return $false
+        }
+    }
+    if ($parts[0] -eq 'rclone') {
+        return $false
+    }
+    return $true
+}
+
+function Test-RcloneHomeLinkTargetsConflict {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    return ($Left -eq $Right -or $Left.StartsWith("$Right/") -or $Right.StartsWith("$Left/"))
+}
+
+function Test-RcloneHomeLinkSourceValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($Source)) {
+        return $false
+    }
+    if ($Source.StartsWith('/') -or $Source.Contains('\') -or $Source -match '\s') {
+        return $false
+    }
+    foreach ($part in $Source.Split('/')) {
+        if ([string]::IsNullOrEmpty($part) -or $part -eq '.' -or $part -eq '..') {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-RcloneHomeLinks {
+    $links = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    $lineno = 0
+    foreach ($raw in ($env:RCLONE_HOME_LINKS -split '\r?\n', [StringSplitOptions]::None)) {
+        $lineno += 1
+        $line = $raw.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 0) {
+            throw "RCLONE_HOME_LINKS line $lineno is missing ="
+        }
+        $target = $line.Substring(0, $separator).Trim()
+        $source = $line.Substring($separator + 1).Trim()
+        $targetDir = $target.EndsWith('/')
+        $sourceDir = $source.EndsWith('/')
+        $target = $target.TrimEnd('/')
+        $source = $source.TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($source)) {
+            throw "RCLONE_HOME_LINKS source is invalid: $source"
+        }
+        if ($targetDir -ne $sourceDir) {
+            throw "RCLONE_HOME_LINKS directory marker mismatch: $target=$source"
+        }
+        $kind = if ($targetDir) { 'dir' } else { 'file' }
+        if (-not (Test-RcloneHomeLinkTargetValid -Target $target)) {
+            throw "RCLONE_HOME_LINKS target is invalid: $target"
+        }
+        if (-not (Test-RcloneHomeLinkSourceValid -Source $source)) {
+            throw "RCLONE_HOME_LINKS source is invalid: $source"
+        }
+        if ($seen.ContainsKey($target)) {
+            throw "RCLONE_HOME_LINKS has a duplicate target: $target"
+        }
+        foreach ($existing in @($seen.Keys)) {
+            if (Test-RcloneHomeLinkTargetsConflict -Left $existing -Right $target) {
+                throw "RCLONE_HOME_LINKS target conflicts with ${existing}: $target"
+            }
+        }
+        $seen[$target] = $true
+        $links.Add([pscustomobject]@{ Target = $target; Source = $source; Kind = $kind })
+    }
+    return $links
+}
+
+function Assert-RcloneHomeLinks {
+    if (-not (Test-RcloneHomeLinksPresent)) {
+        return
+    }
+    $null = Get-RcloneHomeLinks
+}
+
+function Test-RcloneMountIsLive {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+
+function Test-RcloneHasLiveMounts {
+    $root = Get-RcloneCloudRoot
+    if (-not (Test-Path -LiteralPath $root)) {
+        return $false
+    }
+    foreach ($dir in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+        if ($dir.PSIsContainer -and (Test-RcloneMountIsLive -Path $dir.FullName)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-DirectoryIsEmpty {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -eq 0
+}
+
+function ConvertTo-RcloneHomeLinkSourcePath {
+    param([Parameter(Mandatory = $true)][string]$Source)
+
+    return ('rclone\' + ($Source -replace '/', '\'))
+}
+
+function ConvertTo-RcloneHomeLinkRelativeTarget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $profileRoot = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+    $parent = [IO.Path]::GetFullPath((Split-Path -Parent $Destination)).TrimEnd('\')
+    $prefix = ''
+    if ($parent.StartsWith($profileRoot, [StringComparison]::OrdinalIgnoreCase) -and $parent.Length -gt $profileRoot.Length) {
+        $suffix = $parent.Substring($profileRoot.Length).TrimStart('\')
+        $depth = @($suffix.Split('\') | Where-Object { $_ }).Count
+        if ($depth -gt 0) {
+            $prefix = ('..\' * $depth)
+        }
+    }
+    return ($prefix + (ConvertTo-RcloneHomeLinkSourcePath -Source $Source))
+}
+
+function Test-HomeLinkRelativeTargetValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativeTarget)
+
+    $normalized = $RelativeTarget -replace '/', '\'
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $false
+    }
+    if ($normalized.StartsWith('\') -or $normalized -match '^[A-Za-z]:') {
+        return $false
+    }
+    $seenRclone = $false
+    foreach ($part in $normalized.Split('\')) {
+        if ([string]::IsNullOrEmpty($part) -or $part -eq '.') {
+            return $false
+        }
+        if ($part -eq '..') {
+            if ($seenRclone) {
+                return $false
+            }
+            continue
+        }
+        if (-not $seenRclone) {
+            if ($part -ne 'rclone') {
+                return $false
+            }
+            $seenRclone = $true
+            continue
+        }
+    }
+    return $seenRclone
+}
+
+function Test-HomeLinkAncestorsAreLocal {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    $profileRoot = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+    $cursor = Split-Path -Parent $Destination
+    while ($cursor) {
+        $normalized = [IO.Path]::GetFullPath($cursor).TrimEnd('\')
+        if ($normalized.Equals($profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+        if (-not $item) {
+            return $false
+        }
+        if ($item.LinkType -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return $false
+        }
+        if (-not $item.PSIsContainer) {
+            return $false
+        }
+        $next = Split-Path -Parent $cursor
+        if ([string]::IsNullOrWhiteSpace($next) -or $next.Equals($cursor, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+        $cursor = $next
+    }
+    return $true
+}
+
+function Resolve-HomeLinkAbsoluteTarget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$RelativeTarget
+    )
+
+    $normalized = $RelativeTarget -replace '/', '\'
+    $parent = Split-Path -Parent $Destination
+    return [IO.Path]::GetFullPath((Join-Path $parent $normalized))
+}
+
+function Test-HomeLinkMatches {
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$RelativeTarget
+    )
+
+    if (-not $Item.LinkType) {
+        return $false
+    }
+    $normalized = $RelativeTarget -replace '/', '\'
+    $absolute = Resolve-HomeLinkAbsoluteTarget -Destination $Destination -RelativeTarget $RelativeTarget
+    $current = (@($Item.Target)[0] -replace '/', '\')
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        return $false
+    }
+    if ($current -eq $normalized) {
+        return $true
+    }
+    try {
+        return ([IO.Path]::GetFullPath($current) -eq $absolute)
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-RcloneHomeLinkSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$AsFile
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        if ($AsFile -and $item.PSIsContainer -and (Test-DirectoryIsEmpty -Path $Path)) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            New-Item -Path $Path -ItemType File -Force | Out-Null
+        }
+        return
+    }
+    if ($AsFile) {
+        New-Item -Path $Path -ItemType File -Force | Out-Null
+        return
+    }
+    New-Item -Path $Path -ItemType Directory -Force | Out-Null
+}
+
+function New-HomeLink {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$RelativeTarget,
+        [switch]$AsFile
+    )
+
+    $normalized = $RelativeTarget -replace '/', '\'
+    $absolute = Resolve-HomeLinkAbsoluteTarget -Destination $Destination -RelativeTarget $RelativeTarget
+    $errors = [System.Collections.Generic.List[string]]::new()
+
+    try {
+        New-Item -ItemType SymbolicLink -Path $Destination -Target $normalized -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        $errors.Add("symlink: $_")
+    }
+    if (-not $AsFile) {
+        try {
+            New-Item -ItemType Junction -Path $Destination -Target $absolute -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            $errors.Add("junction: $_")
+        }
+        $mklink = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
+            '/c', 'mklink', '/J', $Destination, $absolute
+        ) -Wait -PassThru -WindowStyle Hidden
+        if ($mklink.ExitCode -eq 0) {
+            return $true
+        }
+        $errors.Add("mklink /J exit $($mklink.ExitCode)")
+    } else {
+        $mklink = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
+            '/c', 'mklink', $Destination, $normalized
+        ) -Wait -PassThru -WindowStyle Hidden
+        if ($mklink.ExitCode -eq 0) {
+            return $true
+        }
+        $errors.Add("mklink exit $($mklink.ExitCode)")
+    }
+    Write-Warning ("Could not create home link {0} ({1})" -f $Destination, ($errors -join '; '))
+    return $false
+}
+
+function Install-HomeSymlink {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$RelativeTarget,
+        [switch]$AsFile
+    )
+
+    $normalized = $RelativeTarget -replace '/', '\'
+    if (-not (Test-HomeLinkRelativeTargetValid -RelativeTarget $normalized)) {
+        return $false
+    }
+
+    $item = Get-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        if ($item.LinkType) {
+            if (Test-HomeLinkMatches -Item $item -Destination $Destination -RelativeTarget $normalized) {
+                return $true
+            }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        } elseif ($item.PSIsContainer) {
+            if (-not (Test-DirectoryIsEmpty -Path $Destination)) {
+                return $false
+            }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        } else {
+            return $false
+        }
+    }
+
+    return (New-HomeLink -Destination $Destination -RelativeTarget $normalized -AsFile:$AsFile)
+}
+
+function Add-RcloneHomeLink {
+    param(
+        [Parameter(Mandatory = $true)][string]$Target,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [string]$Kind = 'dir'
+    )
+
+    $dest = $env:USERPROFILE
+    foreach ($part in $Target.Split('/')) {
+        $dest = Join-Path $dest $part
+    }
+    $srcPath = $env:USERPROFILE
+    foreach ($part in (ConvertTo-RcloneHomeLinkSourcePath -Source $Source).Split('\')) {
+        $srcPath = Join-Path $srcPath $part
+    }
+    $rel = ConvertTo-RcloneHomeLinkRelativeTarget -Source $Source -Destination $dest
+    $first = ($Source -split '/')[0]
+    $mount = Join-Path (Get-RcloneCloudRoot) $first
+    $parent = Split-Path -Parent $dest
+
+    if (-not (Test-RcloneMountIsLive -Path $mount)) {
+        Write-Warning "Skipping home link ${Target}: rclone remote $first is not mounted"
+        return
+    }
+    $asFile = $Kind -eq 'file'
+    try {
+        Ensure-RcloneHomeLinkSource -Path $srcPath -AsFile:$asFile
+    } catch {
+        Write-Warning "Skipping home link ${Target}: could not create $srcPath"
+        return
+    }
+    $srcItem = Get-Item -LiteralPath $srcPath -Force -ErrorAction SilentlyContinue
+    if (-not $srcItem) {
+        Write-Warning "Skipping home link ${Target}: source is not a file or directory"
+        return
+    }
+    if ($asFile) {
+        if ($srcItem.PSIsContainer) {
+            Write-Warning "Skipping home link ${Target}: source is a directory but the mapping is a file"
+            return
+        }
+    } elseif (-not $srcItem.PSIsContainer) {
+        Write-Warning "Skipping home link ${Target}: source is not a directory"
+        return
+    }
+    try {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    } catch {
+        Write-Warning "Skipping home link ${Target}: could not create parent $parent"
+        return
+    }
+    if (-not (Test-HomeLinkAncestorsAreLocal -Destination $dest)) {
+        Write-Warning "Skipping home link ${Target}: parent is not a local directory"
+        return
+    }
+    if (Install-HomeSymlink -Destination $dest -RelativeTarget $rel -AsFile:$asFile) {
+        Write-Output "[debug-session] home link ready: $dest -> $rel"
+        return
+    }
+    Write-Warning "Skipping home link ${Target}: $dest already exists or could not be replaced"
+}
+
+function Enable-RcloneHomeLinks {
+    if (-not (Test-RcloneHomeLinksPresent)) {
+        Write-Output '[debug-session] RCLONE_HOME_LINKS is empty; skipping home links'
+        return
+    }
+    if (-not (Test-RcloneHasLiveMounts)) {
+        Write-Warning 'RCLONE_HOME_LINKS is set but rclone mounts are unavailable; skipping home links'
+        return
+    }
+
+    try {
+        $links = @(Get-RcloneHomeLinks)
+    } catch {
+        Write-Warning "RCLONE_HOME_LINKS is invalid after validate; skipping home links"
+        return
+    }
+    Write-Output "[debug-session] applying $($links.Count) rclone home link(s)"
+    foreach ($link in $links) {
+        Add-RcloneHomeLink -Target $link.Target -Source $link.Source -Kind $link.Kind
+    }
+}
+
 function Enter-DebugSession {
     $inputs = Get-ValidatedSessionInput
     Enter-CoreSession
     Enable-RcloneMounts
+    Enable-RcloneHomeLinks
     if ($inputs.SessionProfile -eq 'developer') {
         Install-DeveloperProfile
     }

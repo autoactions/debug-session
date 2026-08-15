@@ -90,8 +90,11 @@ ACCESS_PROFILE=mini SESSION_PROFILE=core SESSION_DEADLINE_EPOCH="$future_deadlin
     fail 'Linux validation failed when RCLONE_CONFIG was invalid'
 
 grep -Fq 'enable_rclone_mounts' "$linux_script" || fail 'Linux does not provision rclone mounts'
+grep -Fq 'enable_rclone_home_links' "$linux_script" || fail 'Linux does not provision rclone home links'
 grep -Fq -- '--vfs-cache-mode writes' "$linux_script" || fail 'Linux does not use vfs-cache-mode writes'
 grep -Fq -- '--allow-other' "$linux_script" && fail 'Linux enables FUSE allow-other'
+grep -Fq -- '--vfs-links' "$linux_script" && fail 'Linux enables rclone VFS symlink translation'
+grep -Fq -- '--links' "$linux_script" && fail 'Linux enables rclone --links'
 grep -Fq 'downloads.rclone.org/rclone-current-linux-' "$linux_script" ||
     fail 'Linux does not install rclone from the official current package'
 grep -Fq 'fuse3' "$linux_script" || fail 'Linux does not install fuse3'
@@ -99,27 +102,56 @@ grep -Fq 'cleanup_rclone_mounts' "$linux_script" || fail 'Linux does not clean u
 
 run_core="$(grep -nF 'enable_core_session' "$linux_script" | tail -n1 | cut -d: -f1)"
 run_rclone="$(grep -nF 'enable_rclone_mounts' "$linux_script" | tail -n1 | cut -d: -f1)"
+run_links="$(grep -nF 'enable_rclone_home_links' "$linux_script" | tail -n1 | cut -d: -f1)"
 run_xfce="$(grep -nF 'enable_xfce_rdp' "$linux_script" | tail -n1 | cut -d: -f1)"
 run_dev="$(grep -nF 'install_developer_profile' "$linux_script" | tail -n1 | cut -d: -f1)"
-[[ -n "$run_core" && -n "$run_rclone" && -n "$run_xfce" && -n "$run_dev" ]] ||
-    fail 'Linux run_session is missing core, rclone, xfce, or developer steps'
-(( run_core < run_rclone && run_rclone < run_xfce && run_rclone < run_dev )) ||
-    fail 'Linux does not mount rclone after Core Session ready and before XFCE/Developer'
+[[ -n "$run_core" && -n "$run_rclone" && -n "$run_links" && -n "$run_xfce" && -n "$run_dev" ]] ||
+    fail 'Linux run_session is missing core, rclone, home links, xfce, or developer steps'
+(( run_core < run_rclone && run_rclone < run_links && run_links < run_xfce && run_links < run_dev )) ||
+    fail 'Linux does not apply home links after rclone mounts and before XFCE/Developer'
 
 cleanup_rclone_line="$(grep -nF 'cleanup_rclone_mounts' "$linux_script" | tail -n1 | cut -d: -f1)"
 cleanup_logout_line="$(grep -nF 'tailscale logout' "$linux_script" | tail -n1 | cut -d: -f1)"
 [[ -n "$cleanup_rclone_line" && -n "$cleanup_logout_line" && "$cleanup_rclone_line" -lt "$cleanup_logout_line" ]] ||
     fail 'Linux does not clean up rclone mounts before Tailscale logout'
 
+wait_line="$(grep -nF 'wait_for_rclone_exit' "$linux_script" | head -n1 | cut -d: -f1)"
+pkill_line="$(grep -nF 'pkill -x rclone' "$linux_script" | tail -n1 | cut -d: -f1)"
+# shellcheck disable=SC2016
+cache_rm_line="$(grep -nF 'rm -rf -- "$HOME/.cache/rclone"' "$linux_script" | tail -n1 | cut -d: -f1)"
+[[ -n "$wait_line" && -n "$pkill_line" && -n "$cache_rm_line" ]] ||
+    fail 'Linux cleanup is missing VFS write-back wait, pkill fallback, or cache removal'
+(( wait_line < pkill_line && pkill_line < cache_rm_line )) ||
+    fail 'Linux does not wait for rclone to exit before force-killing it and deleting the VFS cache'
+
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
     # shellcheck disable=SC2016
     grep -Fq 'RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}' "$workflow" ||
         fail "$workflow does not pass RCLONE_CONFIG as an environment variable"
+    # shellcheck disable=SC2016
+    grep -Fq 'RCLONE_HOME_LINKS: ${{ vars.RCLONE_HOME_LINKS }}' "$workflow" ||
+        fail "$workflow does not pass RCLONE_HOME_LINKS as an environment variable"
     grep -Fq 'enable_rclone' "$workflow" && fail "$workflow adds an enable_rclone input"
     grep -Fq 'REMOTE_NAME' "$workflow" && fail "$workflow still references REMOTE_NAME"
     grep -Fq "echo '\${{ secrets.RCLONE_CONFIG }}'" "$workflow" &&
         fail "$workflow writes RCLONE_CONFIG through echo of the secret expression"
 done
+
+grep -Fq '$HOME"/rclone/*' "$smoke_workflow" ||
+    fail 'Linux smoke does not check $HOME/rclone mounts'
+grep -Fq "Join-Path \$env:USERPROFILE 'rclone'" "$smoke_workflow" ||
+    fail 'Windows smoke does not check %USERPROFILE%\\rclone mounts'
+grep -Fq '/cloud' "$smoke_workflow" && fail 'smoke still checks the old cloud mount root'
+grep -Fq "'cloud'" "$smoke_workflow" && fail 'smoke still checks the old cloud mount root'
+grep -Fq 'rclone_home_link_relative_target' "$smoke_workflow" ||
+    fail 'Linux smoke does not verify nested home-link relative targets'
+grep -Fq 'Get-RcloneHomeLinks' "$smoke_workflow" ||
+    fail 'Windows smoke does not parse home links with Get-RcloneHomeLinks'
+grep -Fq 'ConvertTo-RcloneHomeLinkRelativeTarget' "$smoke_workflow" ||
+    fail 'Windows smoke does not verify nested home-link relative targets'
+# shellcheck disable=SC2016
+grep -Fq 'rel="rclone/$source"' "$smoke_workflow" &&
+    fail 'Linux smoke still assumes top-level rclone/$source home links'
 
 grep -Fq 'rclone_config_present' "$linux_script" || fail 'Linux does not skip rclone when the secret is empty'
 
