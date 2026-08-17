@@ -115,7 +115,7 @@ jobs:
           source scripts/linux.sh
           while IFS=$'\t' read -r name url; do
             [[ -n "$name" ]] || continue
-            dest="$HOME/workspaces/$name"
+            dest="$(git_workspace_destination "$name")"
             [[ -d "$dest/.git" ]] || {
               echo "git workspace missing: $dest" >&2
               exit 1
@@ -253,12 +253,8 @@ jobs:
             throw 'Windows is missing git workspace helper functions'
           }
           Invoke-Expression $windowsScript.Substring($start, $end - $start)
-          $root = Join-Path $env:USERPROFILE 'workspaces'
           foreach ($workspace in @(Get-GitWorkspaces)) {
-            $dest = $root
-            foreach ($part in $workspace.Name.Split('/')) {
-              $dest = Join-Path $dest $part
-            }
+            $dest = Get-GitWorkspaceDestination -Name $workspace.Name
             if (-not (Test-Path -LiteralPath (Join-Path $dest '.git'))) {
               throw "git workspace missing: $dest"
             }

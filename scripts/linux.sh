@@ -1044,7 +1044,12 @@ git_workspaces_present() {
 }
 
 workspace_root() {
-    printf '%s/workspaces' "$HOME"
+    printf '%s' "${HOME%/}"
+}
+
+git_workspace_destination() {
+    local name="$1"
+    printf '%s/%s\n' "$(workspace_root)" "$name"
 }
 
 git_workspace_name_component_valid() {
@@ -1099,7 +1104,7 @@ git_workspace_expand_shorthand() {
 git_workspace_name_from_shorthand() {
     local spec="$1"
     spec="${spec%.git}"
-    printf '%s\n' "$spec"
+    printf '%s\n' "${spec##*/}"
 }
 
 git_workspace_name_from_url() {
@@ -1108,7 +1113,29 @@ git_workspace_name_from_url() {
     rest="${url#https://}"
     rest="${rest#*/}"
     rest="${rest%.git}"
-    printf '%s\n' "$rest"
+    while [[ "$rest" == */ ]]; do
+        rest="${rest%/}"
+    done
+    printf '%s\n' "${rest##*/}"
+}
+
+git_workspace_normalize_url() {
+    local url="$1"
+    while [[ "$url" == */ ]]; do
+        url="${url%/}"
+    done
+    url="${url%.git}"
+    printf '%s\n' "$url"
+}
+
+git_workspace_destination_valid() {
+    local dest="$1"
+    local home rclone
+    home="$(workspace_root)"
+    rclone="$home/rclone"
+    [[ "$dest" != "$home" ]] || return 1
+    [[ "$dest" != "$rclone" && "$dest" != "$rclone"/* ]] || return 1
+    return 0
 }
 
 parse_git_workspaces() {
@@ -1160,6 +1187,10 @@ parse_git_workspaces() {
             printf 'GIT_WORKSPACES name is invalid: %s\n' "$name" >&2
             return 1
         fi
+        if ! git_workspace_destination_valid "$(git_workspace_destination "$name")"; then
+            printf 'GIT_WORKSPACES destination is invalid: %s\n' "$name" >&2
+            return 1
+        fi
         if [[ -n "${seen[$name]:-}" ]]; then
             printf 'GIT_WORKSPACES has a duplicate name: %s\n' "$name" >&2
             return 1
@@ -1188,6 +1219,22 @@ git_workspace_credential_helper() {
     printf '%s\n' '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f'
 }
 
+git_workspace_cmd() {
+    local -a git_cmd=(git)
+    if [[ -n "${GIT_WORKSPACES_TOKEN:-}" ]]; then
+        git_cmd+=(-c credential.helper= -c "credential.helper=$(git_workspace_credential_helper)")
+    fi
+    GIT_TERMINAL_PROMPT=0 "${git_cmd[@]}" "$@"
+}
+
+git_workspace_remote_matches() {
+    local dest="$1"
+    local expected="$2"
+    local actual
+    actual="$(git -C "$dest" remote get-url origin 2>/dev/null)" || return 1
+    [[ "$(git_workspace_normalize_url "$actual")" == "$(git_workspace_normalize_url "$expected")" ]]
+}
+
 ensure_git() {
     if command -v git >/dev/null 2>&1; then
         return 0
@@ -1200,10 +1247,14 @@ clone_git_workspace() {
     local name="$1"
     local url="$2"
     local dest
-    dest="$(workspace_root)/$name"
+    dest="$(git_workspace_destination "$name")"
 
     if [[ -d "$dest/.git" ]]; then
-        log "git workspace already present: $dest"
+        if git_workspace_remote_matches "$dest" "$url"; then
+            log "git workspace already present: $dest"
+        else
+            warn "Skipping git workspace ${name}: ${dest} is a different git remote"
+        fi
         return 0
     fi
     if [[ -e "$dest" ]]; then
@@ -1216,12 +1267,7 @@ clone_git_workspace() {
         return 0
     fi
 
-    local -a git_cmd=(git)
-    if [[ -n "${GIT_WORKSPACES_TOKEN:-}" ]]; then
-        git_cmd+=(-c credential.helper= -c "credential.helper=$(git_workspace_credential_helper)")
-    fi
-    git_cmd+=(clone --depth=1 -- "$url" "$dest")
-    if GIT_TERMINAL_PROMPT=0 "${git_cmd[@]}"; then
+    if git_workspace_cmd clone --depth=1 -- "$url" "$dest"; then
         log "git workspace ready: $dest"
         return 0
     fi
@@ -1251,6 +1297,98 @@ enable_git_workspaces() {
     return 0
 }
 
+git_workspace_ensure_identity() {
+    local dest="$1"
+    if [[ -z "$(git -C "$dest" config --get user.name 2>/dev/null || true)" ]]; then
+        git -C "$dest" config user.name debug-session
+    fi
+    if [[ -z "$(git -C "$dest" config --get user.email 2>/dev/null || true)" ]]; then
+        git -C "$dest" config user.email debug-session@users.noreply.github.com
+    fi
+}
+
+git_workspace_rebase_and_push() {
+    local dest="$1"
+
+    git -C "$dest" rebase --abort >/dev/null 2>&1 || true
+    if git_workspace_cmd -C "$dest" fetch origin &&
+        git_workspace_cmd -C "$dest" rebase '@{u}' &&
+        git_workspace_cmd -C "$dest" push; then
+        return 0
+    fi
+
+    git -C "$dest" rebase --abort >/dev/null 2>&1 || true
+    if git_workspace_cmd -C "$dest" fetch --unshallow origin &&
+        git_workspace_cmd -C "$dest" rebase '@{u}' &&
+        git_workspace_cmd -C "$dest" push; then
+        return 0
+    fi
+
+    git -C "$dest" rebase --abort >/dev/null 2>&1 || true
+    return 1
+}
+
+sync_git_workspace() {
+    local name="$1"
+    local dest
+    dest="$(git_workspace_destination "$name")"
+
+    if [[ ! -d "$dest/.git" ]]; then
+        return 0
+    fi
+
+    if ! git_workspace_ensure_identity "$dest"; then
+        warn "git identity failed for ${name}"
+        return 0
+    fi
+
+    if ! git -C "$dest" add -A; then
+        warn "git add failed for ${name}"
+        return 0
+    fi
+
+    if [[ -n "$(git -C "$dest" status --porcelain 2>/dev/null || true)" ]]; then
+        local host ts
+        host="$(hostname -s 2>/dev/null || hostname || printf 'runner')"
+        ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if ! git -C "$dest" commit -m "debug-session sync: ${host} ${ts}"; then
+            warn "git commit failed for ${name}"
+            return 0
+        fi
+        log "git workspace committed: $dest"
+    else
+        log "git workspace unchanged: $dest"
+    fi
+
+    if git_workspace_rebase_and_push "$dest"; then
+        log "git workspace synced: $dest"
+        return 0
+    fi
+    warn "git push failed for ${name}"
+    return 0
+}
+
+sync_git_workspaces() {
+    if ! git_workspaces_present; then
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        warn 'git is unavailable; skipping git workspace sync'
+        return 0
+    fi
+    if ! parse_git_workspaces >/dev/null; then
+        warn 'GIT_WORKSPACES is invalid after validate; skipping git workspace sync'
+        return 0
+    fi
+
+    local name url
+    while IFS=$'\t' read -r name url; do
+        [[ -n "$name" ]] || continue
+        sync_git_workspace "$name"
+    done < <(parse_git_workspaces)
+    return 0
+}
+
 run_session() {
     enable_core_session
     enable_rclone_mounts
@@ -1272,6 +1410,7 @@ oauth_cleanup_configured() {
 }
 
 cleanup() {
+    sync_git_workspaces || warn 'git workspace sync failed; continuing rclone cleanup'
     cleanup_rclone_mounts || warn 'rclone cleanup failed; continuing Tailscale cleanup'
 
     local logout_status=0

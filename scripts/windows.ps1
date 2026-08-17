@@ -1668,7 +1668,40 @@ function Test-GitWorkspacesPresent {
 }
 
 function Get-GitWorkspaceRoot {
-    return (Join-Path $env:USERPROFILE 'workspaces')
+    return $env:USERPROFILE
+}
+
+function Get-GitWorkspaceDestination {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $dest = Get-GitWorkspaceRoot
+    foreach ($part in $Name.Split('/')) {
+        $dest = Join-Path $dest $part
+    }
+    return $dest
+}
+
+function Test-GitWorkspaceDestinationValid {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Destination)
+
+    if ([string]::IsNullOrWhiteSpace($Destination) -or [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        return $false
+    }
+    $home = [IO.Path]::GetFullPath($env:USERPROFILE)
+    try {
+        $dest = [IO.Path]::GetFullPath($Destination)
+    } catch {
+        return $false
+    }
+    $rclone = [IO.Path]::GetFullPath((Join-Path $home 'rclone'))
+    if ($dest -eq $home) {
+        return $false
+    }
+    $prefix = $rclone + [IO.Path]::DirectorySeparatorChar
+    if ($dest -eq $rclone -or $dest.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    return $true
 }
 
 function Test-GitWorkspaceNameComponentValid {
@@ -1749,10 +1782,15 @@ function ConvertTo-GitWorkspaceUrlFromShorthand {
 function ConvertTo-GitWorkspaceNameFromShorthand {
     param([Parameter(Mandatory = $true)][string]$Spec)
 
-    if ($Spec.EndsWith('.git')) {
-        return $Spec.Substring(0, $Spec.Length - 4)
+    $name = $Spec
+    if ($name.EndsWith('.git')) {
+        $name = $name.Substring(0, $name.Length - 4)
     }
-    return $Spec
+    $slash = $name.LastIndexOf('/')
+    if ($slash -ge 0) {
+        return $name.Substring($slash + 1)
+    }
+    return $name
 }
 
 function ConvertTo-GitWorkspaceNameFromUrl {
@@ -1767,7 +1805,25 @@ function ConvertTo-GitWorkspaceNameFromUrl {
     if ($name.EndsWith('.git')) {
         $name = $name.Substring(0, $name.Length - 4)
     }
+    $name = $name.TrimEnd('/')
+    $slash = $name.LastIndexOf('/')
+    if ($slash -ge 0) {
+        $name = $name.Substring($slash + 1)
+    }
     return $name
+}
+
+function ConvertTo-GitWorkspaceNormalizedUrl {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $normalized = $Url.Trim()
+    while ($normalized.EndsWith('/')) {
+        $normalized = $normalized.Substring(0, $normalized.Length - 1)
+    }
+    if ($normalized.EndsWith('.git')) {
+        $normalized = $normalized.Substring(0, $normalized.Length - 4)
+    }
+    return $normalized
 }
 
 function Get-GitWorkspaces {
@@ -1810,6 +1866,9 @@ function Get-GitWorkspaces {
         if (-not (Test-GitWorkspaceNameValid -Name $name)) {
             throw "GIT_WORKSPACES name is invalid: $name"
         }
+        if (-not (Test-GitWorkspaceDestinationValid -Destination (Get-GitWorkspaceDestination -Name $name))) {
+            throw "GIT_WORKSPACES destination is invalid: $name"
+        }
         if ($seen.ContainsKey($name)) {
             throw "GIT_WORKSPACES has a duplicate name: $name"
         }
@@ -1835,6 +1894,41 @@ function Get-GitWorkspaceCredentialHelper {
     return '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f'
 }
 
+function Invoke-GitWorkspaceCommand {
+    param([Parameter(Mandatory = $true)][string[]]$GitArgs)
+
+    $previousPrompt = $env:GIT_TERMINAL_PROMPT
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $invokeArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:GIT_WORKSPACES_TOKEN)) {
+        $invokeArgs += @('-c', 'credential.helper=', '-c', ('credential.helper=' + (Get-GitWorkspaceCredentialHelper)))
+    }
+    $invokeArgs += $GitArgs
+    try {
+        & git @invokeArgs
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        if ($null -ne $previousPrompt) {
+            $env:GIT_TERMINAL_PROMPT = $previousPrompt
+        } else {
+            Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-GitWorkspaceRemoteMatches {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+
+    $actual = & git -C $Destination remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($actual)) {
+        return $false
+    }
+    return (ConvertTo-GitWorkspaceNormalizedUrl -Url $actual.Trim()) -eq (ConvertTo-GitWorkspaceNormalizedUrl -Url $Url)
+}
+
 function Test-GitAvailable {
     return [bool](Get-Command git -ErrorAction SilentlyContinue)
 }
@@ -1845,12 +1939,13 @@ function Add-GitWorkspace {
         [Parameter(Mandatory = $true)][string]$Url
     )
 
-    $dest = Get-GitWorkspaceRoot
-    foreach ($part in $Name.Split('/')) {
-        $dest = Join-Path $dest $part
-    }
+    $dest = Get-GitWorkspaceDestination -Name $Name
     if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
-        Write-Output "[debug-session] git workspace already present: $dest"
+        if (Test-GitWorkspaceRemoteMatches -Destination $dest -Url $Url) {
+            Write-Output "[debug-session] git workspace already present: $dest"
+        } else {
+            Write-Warning "Skipping git workspace ${Name}: $dest is a different git remote"
+        }
         return
     }
     if (Test-Path -LiteralPath $dest) {
@@ -1866,21 +1961,7 @@ function Add-GitWorkspace {
         return
     }
 
-    $previousPrompt = $env:GIT_TERMINAL_PROMPT
-    $env:GIT_TERMINAL_PROMPT = '0'
-    $gitArgs = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:GIT_WORKSPACES_TOKEN)) {
-        $gitArgs += @('-c', 'credential.helper=', '-c', ('credential.helper=' + (Get-GitWorkspaceCredentialHelper)))
-    }
-    $gitArgs += @('clone', '--depth=1', '--', $Url, $dest)
-    & git @gitArgs
-    $cloneFailed = $LASTEXITCODE -ne 0
-    if ($null -ne $previousPrompt) {
-        $env:GIT_TERMINAL_PROMPT = $previousPrompt
-    } else {
-        Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
-    }
-    if (-not $cloneFailed) {
+    if (Invoke-GitWorkspaceCommand -GitArgs @('clone', '--depth=1', '--', $Url, $dest)) {
         Write-Output "[debug-session] git workspace ready: $dest"
         return
     }
@@ -1908,6 +1989,111 @@ function Enable-GitWorkspaces {
 
     foreach ($workspace in $workspaces) {
         Add-GitWorkspace -Name $workspace.Name -Url $workspace.Url
+    }
+}
+
+function Set-GitWorkspaceIdentity {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    $name = & git -C $Destination config --get user.name 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($name)) {
+        & git -C $Destination config user.name debug-session
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+    }
+    $email = & git -C $Destination config --get user.email 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($email)) {
+        & git -C $Destination config user.email debug-session@users.noreply.github.com
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Invoke-GitWorkspaceRebaseAndPush {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    & git -C $Destination rebase --abort *> $null
+    if ((Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'fetch', 'origin')) -and
+        (Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'rebase', '@{u}')) -and
+        (Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'push'))) {
+        return $true
+    }
+
+    & git -C $Destination rebase --abort *> $null
+    if ((Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'fetch', '--unshallow', 'origin')) -and
+        (Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'rebase', '@{u}')) -and
+        (Invoke-GitWorkspaceCommand -GitArgs @('-C', $Destination, 'push'))) {
+        return $true
+    }
+
+    & git -C $Destination rebase --abort *> $null
+    return $false
+}
+
+function Sync-GitWorkspace {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $dest = Get-GitWorkspaceDestination -Name $Name
+    if (-not (Test-Path -LiteralPath (Join-Path $dest '.git'))) {
+        return
+    }
+
+    if (-not (Set-GitWorkspaceIdentity -Destination $dest)) {
+        Write-Warning "git identity failed for $Name"
+        return
+    }
+
+    & git -C $dest add -A
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "git add failed for $Name"
+        return
+    }
+
+    $status = & git -C $dest status --porcelain
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($status | Out-String))) {
+        $hostName = $env:COMPUTERNAME
+        if ([string]::IsNullOrWhiteSpace($hostName)) {
+            $hostName = 'runner'
+        }
+        $timestamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        & git -C $dest commit -m "debug-session sync: $hostName $timestamp"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "git commit failed for $Name"
+            return
+        }
+        Write-Output "[debug-session] git workspace committed: $dest"
+    } else {
+        Write-Output "[debug-session] git workspace unchanged: $dest"
+    }
+
+    if (Invoke-GitWorkspaceRebaseAndPush -Destination $dest) {
+        Write-Output "[debug-session] git workspace synced: $dest"
+        return
+    }
+    Write-Warning "git push failed for $Name"
+}
+
+function Sync-GitWorkspaces {
+    if (-not (Test-GitWorkspacesPresent)) {
+        return
+    }
+    if (-not (Test-GitAvailable)) {
+        Write-Warning 'git is unavailable; skipping git workspace sync'
+        return
+    }
+
+    try {
+        $workspaces = @(Get-GitWorkspaces)
+    } catch {
+        Write-Warning 'GIT_WORKSPACES is invalid after validate; skipping git workspace sync'
+        return
+    }
+
+    foreach ($workspace in $workspaces) {
+        Sync-GitWorkspace -Name $workspace.Name
     }
 }
 
@@ -1944,6 +2130,12 @@ function Test-OAuthCleanupConfigured {
 }
 
 function Close-DebugSession {
+    try {
+        Sync-GitWorkspaces
+    } catch {
+        Write-Warning "git workspace sync failed; continuing rclone cleanup: $_"
+    }
+
     try {
         Close-RcloneMounts
     } catch {

@@ -141,8 +141,15 @@ grep -Fq 'Get-RcloneHomeLinks' "$smoke_workflow" ||
     fail 'Windows smoke does not parse home links with Get-RcloneHomeLinks'
 grep -Fq 'parse_git_workspaces' "$smoke_workflow" ||
     fail 'Linux smoke does not verify git workspaces'
+grep -Fq 'git_workspace_destination' "$smoke_workflow" ||
+    fail 'Linux smoke still assumes \$HOME/workspaces dests'
 grep -Fq 'Get-GitWorkspaces' "$smoke_workflow" ||
     fail 'Windows smoke does not verify git workspaces'
+grep -Fq 'Get-GitWorkspaceDestination' "$smoke_workflow" ||
+    fail 'Windows smoke still assumes %USERPROFILE%\\workspaces dests'
+if grep -Fq '$HOME/workspaces/$name' "$smoke_workflow"; then
+    fail 'Linux smoke still hard-codes \$HOME/workspaces dests'
+fi
 grep -Fq 'ConvertTo-RcloneHomeLinkRelativeTarget' "$smoke_workflow" ||
     fail 'Windows smoke does not verify nested home-link relative targets'
 # shellcheck disable=SC2016

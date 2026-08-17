@@ -118,9 +118,24 @@ $env:GIT_WORKSPACES = @"
 https://github.com/org/proj-a
 my-app=https://github.com/org/proj-c
 org/priv
+lirtual/.grok
 "@
 Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline `
     -Candidate '12345678'
+Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
+
+$env:GIT_WORKSPACES = 'rclone/foo=org/foo'
+try {
+    Invoke-Validation -SessionProfile 'core' -EnableWsl 'false' -Deadline $futureDeadline
+    throw 'Windows validation accepted a GIT_WORKSPACES destination under rclone'
+} catch {
+    if ($_.Exception.Message -eq 'Windows validation accepted a GIT_WORKSPACES destination under rclone') {
+        throw
+    }
+    if ($_.Exception.Message -notlike '*destination is invalid*') {
+        throw "Windows validation returned an unexpected git workspace destination error: $_"
+    }
+}
 Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
 
 $env:GIT_WORKSPACES = "https://github.com/org/a`nhttps://github.com/other/a.git"
@@ -260,8 +275,14 @@ if ($windowsScript -notmatch 'Enable-RcloneHomeLinks') {
 if ($windowsScript -notmatch 'Enable-GitWorkspaces') {
     throw 'Windows does not provision git workspaces'
 }
-if ($windowsScript -notmatch "Join-Path \$env:USERPROFILE 'workspaces'") {
-    throw 'Windows does not clone git workspaces under the user workspaces directory'
+if ($windowsScript -notmatch 'function Get-GitWorkspaceDestination') {
+    throw 'Windows does not resolve git workspace destinations under the user profile'
+}
+if ($windowsScript -match "Join-Path \$env:USERPROFILE 'workspaces'") {
+    throw 'Windows still clones git workspaces under the user workspaces directory'
+}
+if ($windowsScript -notmatch 'Sync-GitWorkspaces') {
+    throw 'Windows does not sync git workspaces on cleanup'
 }
 if ($windowsScript -match 'home links are not implemented on Windows') {
     throw 'Windows still no-ops rclone home links'
@@ -281,6 +302,15 @@ if ($enableCore -lt 0 -or $enableRclone -lt 0 -or $enableLinks -lt 0 -or $enable
 }
 if (-not ($enableCore -lt $enableRclone -and $enableRclone -lt $enableLinks -and $enableLinks -lt $enableGit -and $enableGit -lt $enableDeveloper -and $enableGit -lt $enableWsl)) {
     throw 'Windows does not clone git workspaces after home links and before Developer/WSL'
+}
+$closeSession = $windowsScript.LastIndexOf('function Close-DebugSession')
+$syncGit = $windowsScript.LastIndexOf('        Sync-GitWorkspaces')
+$closeRclone = $windowsScript.LastIndexOf('        Close-RcloneMounts')
+if ($closeSession -lt 0 -or $syncGit -lt 0 -or $closeRclone -lt 0) {
+    throw 'Windows cleanup is missing git sync or rclone cleanup'
+}
+if (-not ($closeSession -lt $syncGit -and $syncGit -lt $closeRclone)) {
+    throw 'Windows does not sync git workspaces before rclone cleanup'
 }
 if ($windowsScript -notmatch '\$env:WSL_UTF8 = ''1''') {
     throw 'Windows does not force UTF-8 WSL CLI output'
@@ -551,13 +581,13 @@ $gitParsed = @(Get-GitWorkspaces)
 if ($gitParsed.Count -ne 3) {
     throw "Windows parsed $($gitParsed.Count) git workspaces, expected 3"
 }
-if ($gitParsed[0].Name -ne 'org/proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
+if ($gitParsed[0].Name -ne 'proj-a' -or $gitParsed[0].Url -ne 'https://github.com/org/proj-a.git') {
     throw "Windows first git workspace was $($gitParsed[0].Name)=$($gitParsed[0].Url)"
 }
 if ($gitParsed[1].Name -ne 'my-app' -or $gitParsed[1].Url -ne 'https://github.com/org/proj-c') {
     throw "Windows custom-name git workspace was $($gitParsed[1].Name)=$($gitParsed[1].Url)"
 }
-if ($gitParsed[2].Name -ne 'org/priv' -or $gitParsed[2].Url -ne 'https://github.com/org/priv') {
+if ($gitParsed[2].Name -ne 'priv' -or $gitParsed[2].Url -ne 'https://github.com/org/priv') {
     throw "Windows shorthand git workspace was $($gitParsed[2].Name)=$($gitParsed[2].Url)"
 }
 Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
@@ -565,11 +595,26 @@ Remove-Item Env:GIT_WORKSPACES -ErrorAction SilentlyContinue
 if ((Get-GitWorkspaceCredentialHelper) -cne '!f() { echo username=x-access-token; echo password=$GIT_WORKSPACES_TOKEN; }; f') {
     throw 'Windows credential helper does not read GIT_WORKSPACES_TOKEN from the environment'
 }
-if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/org/proj-b.git') -ne 'org/proj-b') {
-    throw 'Windows did not keep owner/repo from the URL'
+if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/org/proj-b.git') -ne 'proj-b') {
+    throw 'Windows did not use the repo name from the URL'
 }
-if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/autoactions/debug-session') -ne 'autoactions/debug-session') {
-    throw 'Windows did not derive autoactions/debug-session from the GitHub URL'
+if ((ConvertTo-GitWorkspaceNameFromUrl -Url 'https://github.com/autoactions/debug-session') -ne 'debug-session') {
+    throw 'Windows did not derive debug-session from the GitHub URL'
+}
+if ((ConvertTo-GitWorkspaceNameFromShorthand -Spec 'lirtual/.grok') -ne '.grok') {
+    throw 'Windows did not use the repo name from a shorthand spec'
+}
+if ((Get-GitWorkspaceDestination -Name '.grok') -ne (Join-Path $env:USERPROFILE '.grok')) {
+    throw 'Windows did not resolve .grok under the user profile'
+}
+if ((Get-GitWorkspaceDestination -Name 'workspaces/notes') -ne (Join-Path (Join-Path $env:USERPROFILE 'workspaces') 'notes')) {
+    throw 'Windows did not resolve nested explicit destinations under the user profile'
+}
+if (Test-GitWorkspaceDestinationValid -Destination (Join-Path $env:USERPROFILE 'rclone')) {
+    throw 'Windows accepted a git workspace destination at the rclone root'
+}
+if (Test-GitWorkspaceDestinationValid -Destination (Join-Path (Join-Path $env:USERPROFILE 'rclone') 'foo')) {
+    throw 'Windows accepted a git workspace destination under rclone'
 }
 if (-not (Test-GitWorkspaceUrlValid -Url 'https://gitlab.example.com:8443/group/sub/repo.git')) {
     throw 'Windows rejected a valid git workspace URL with a port'

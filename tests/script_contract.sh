@@ -134,6 +134,19 @@ fi
 if ! awk '/^validate_inputs\(\)/,/^}/' "$linux_script" | grep -Fq 'validate_git_workspaces'; then
     fail 'Linux does not validate GIT_WORKSPACES during input validation'
 fi
+grep -Fq 'sync_git_workspaces' "$linux_script" ||
+    fail 'Linux does not sync git workspaces on cleanup'
+cleanup_fn="$(awk '/^cleanup\(\)/,/^}/' "$linux_script")"
+printf '%s\n' "$cleanup_fn" | grep -Fq 'sync_git_workspaces' ||
+    fail 'Linux cleanup does not sync git workspaces'
+printf '%s\n' "$cleanup_fn" | grep -Fq 'cleanup_rclone_mounts' ||
+    fail 'Linux cleanup does not unmount rclone'
+sync_line="$(printf '%s\n' "$cleanup_fn" | grep -nF 'sync_git_workspaces' | head -n1 | cut -d: -f1)"
+rclone_cleanup_line="$(printf '%s\n' "$cleanup_fn" | grep -nF 'cleanup_rclone_mounts' | head -n1 | cut -d: -f1)"
+[[ -n "$sync_line" && -n "$rclone_cleanup_line" ]] ||
+    fail 'Linux cleanup is missing git sync or rclone cleanup'
+(( sync_line < rclone_cleanup_line )) ||
+    fail 'Linux does not sync git workspaces before rclone cleanup'
 # shellcheck disable=SC2016
 grep -Fq 'enable_git_workspaces' "$linux_script" ||
     fail 'Linux does not provision git workspaces'
