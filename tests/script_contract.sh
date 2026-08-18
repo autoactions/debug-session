@@ -163,4 +163,15 @@ developer_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'install_develop
 (( links_line < workspaces_line && workspaces_line < developer_line )) ||
     fail 'Linux does not clone git workspaces after home links and before the Developer Profile'
 
+grep -Fq 'https://herdr.dev/latest.json' "$linux_script" ||
+    fail 'Linux does not install herdr from the official latest manifest'
+grep -Fq '/usr/local/bin/herdr' "$linux_script" ||
+    fail 'Linux does not install herdr on PATH'
+if ! awk '/^install_developer_profile\(\)/,/^}/' "$linux_script" | grep -Fq 'install_herdr'; then
+    fail 'Linux Developer Profile does not install herdr'
+fi
+if ! awk '/^install_herdr\(\)/,/^}/' "$linux_script" | grep -Fq 'sha256sum'; then
+    fail 'Linux does not verify the herdr checksum'
+fi
+
 printf 'Linux input behavior: PASS\n'

@@ -419,6 +419,65 @@ enable_xfce_rdp() {
     printf 'RDP: %s:3389\n' "$tailscale_ip"
 }
 
+linux_herdr_target() {
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            printf '%s\n' 'linux-x86_64'
+            ;;
+        aarch64 | arm64)
+            printf '%s\n' 'linux-aarch64'
+            ;;
+        *)
+            printf 'Unsupported Linux architecture for herdr: %s\n' "$(uname -m)" >&2
+            return 1
+            ;;
+    esac
+}
+
+read_herdr_release() {
+    local target="$1"
+    python3 -c '
+import json, sys
+target = sys.argv[1]
+payload = json.load(sys.stdin)
+assets = payload.get("assets") or {}
+checksums = payload.get("sha256") or {}
+url = assets.get(target) or ""
+digest = (checksums.get(target) or "").lower()
+if not url or len(digest) != 64:
+    sys.exit(1)
+print(f"{url}\t{digest}")
+' "$target"
+}
+
+install_herdr() {
+    if command -v herdr >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local target manifest url digest archive actual
+    target="$(linux_herdr_target)" || return 1
+    manifest="$(curl -fsSL --retry 3 --retry-all-errors 'https://herdr.dev/latest.json')" || return 1
+    IFS=$'\t' read -r url digest < <(read_herdr_release "$target" <<<"$manifest") || return 1
+    [[ -n "$url" && ${#digest} -eq 64 ]] || return 1
+
+    archive="$(mktemp)" || return 1
+    if ! curl -fsSL --retry 3 --retry-all-errors "$url" -o "$archive"; then
+        rm -f -- "$archive"
+        return 1
+    fi
+    actual="$(sha256sum <"$archive" | awk '{ print tolower($1) }')"
+    if [[ "$actual" != "$digest" ]]; then
+        rm -f -- "$archive"
+        return 1
+    fi
+    if ! sudo install -m 0755 "$archive" /usr/local/bin/herdr; then
+        rm -f -- "$archive"
+        return 1
+    fi
+    rm -f -- "$archive"
+}
+
 install_oh_my_zsh() {
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git zsh || return
 
@@ -480,6 +539,10 @@ install_developer_profile() {
         if ! command -v grok >/dev/null 2>&1 && ! npm install --global @xai-official/grok; then
             failed+=(grok)
         fi
+    fi
+
+    if ! install_herdr; then
+        failed+=(herdr)
     fi
 
     if ! install_oh_my_zsh; then

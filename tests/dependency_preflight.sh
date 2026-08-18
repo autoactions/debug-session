@@ -22,6 +22,7 @@ check_url 'Tailscale Windows stable index' 'https://pkgs.tailscale.com/stable/?m
 check_url 'VS Code apt repository' 'https://packages.microsoft.com/repos/code/dists/stable/Release'
 check_url 'VS Code Windows release index' 'https://update.code.visualstudio.com/api/releases/stable'
 check_url 'Node.js distribution index' 'https://nodejs.org/dist/index.json'
+check_url 'Herdr latest manifest' 'https://herdr.dev/latest.json'
 check_url 'rclone Linux amd64 package' 'https://downloads.rclone.org/rclone-current-linux-amd64.zip'
 check_url 'rclone Windows amd64 package' 'https://downloads.rclone.org/rclone-current-windows-amd64.zip'
 check_url 'WinFsp GitHub latest release' 'https://api.github.com/repos/winfsp/winfsp/releases/latest'
