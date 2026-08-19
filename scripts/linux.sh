@@ -664,12 +664,19 @@ linux_rclone_archive_url() {
 }
 
 ensure_rclone_and_fuse() {
+    local -a pkgs=()
     if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+        pkgs+=(fuse3)
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        pkgs+=(unzip)
+    fi
+    if ! command -v bindfs >/dev/null 2>&1; then
+        pkgs+=(bindfs)
+    fi
+    if (( ${#pkgs[@]} > 0 )); then
         sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fuse3 unzip
-    elif ! command -v unzip >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y unzip
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
     fi
 
     if command -v rclone >/dev/null 2>&1; then
@@ -768,10 +775,10 @@ unmount_rclone_path() {
 unmount_home_bind() {
     local dest="$1"
     mountpoint -q "$dest" 2>/dev/null || return 0
-    umount "$dest" 2>/dev/null ||
-        sudo umount "$dest" 2>/dev/null ||
-        fusermount3 -u "$dest" 2>/dev/null ||
+    fusermount3 -u "$dest" 2>/dev/null ||
         fusermount -u "$dest" 2>/dev/null ||
+        umount "$dest" 2>/dev/null ||
+        sudo umount "$dest" 2>/dev/null ||
         true
 }
 
@@ -1028,18 +1035,29 @@ ensure_rclone_home_link_source() {
 home_bind_matches() {
     local dest="$1"
     local src="$2"
-    local dest_id src_id
+    local dest_id src_id dest_src src_real
     mountpoint -q "$dest" 2>/dev/null || return 1
     dest_id="$(stat -c '%d:%i' "$dest" 2>/dev/null)" || return 1
     src_id="$(stat -c '%d:%i' "$src" 2>/dev/null)" || return 1
-    [[ -n "$dest_id" && "$dest_id" == "$src_id" ]]
+    if [[ -n "$dest_id" && "$dest_id" == "$src_id" ]]; then
+        return 0
+    fi
+    dest_src="$(findmnt -n -o SOURCE --mountpoint "$dest" 2>/dev/null)" || return 1
+    src_real="$(realpath -- "$src" 2>/dev/null || printf '%s' "$src")"
+    [[ -n "$dest_src" && ( "$dest_src" == "$src" || "$dest_src" == "$src_real" ) ]]
 }
 
 bind_home_path() {
     local src="$1"
     local dest="$2"
+
     if mount --bind "$src" "$dest" 2>/dev/null; then
         return 0
+    fi
+    if [[ -d "$src" ]] && command -v bindfs >/dev/null 2>&1; then
+        if bindfs --no-allow-other "$src" "$dest" && mountpoint -q "$dest" 2>/dev/null; then
+            return 0
+        fi
     fi
     sudo mount --bind "$src" "$dest"
 }
@@ -1162,7 +1180,7 @@ apply_rclone_home_link() {
         log "home mount ready: ${dest} <= ${src_path}"
         return 0
     fi
-    warn "Skipping home link ${target}: ${dest} already exists or could not be replaced"
+    warn "Skipping home mount ${target}: could not bind ${src_path} onto ${dest}"
     return 0
 }
 

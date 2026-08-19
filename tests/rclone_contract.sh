@@ -103,6 +103,8 @@ grep -Fq -- '--links' "$linux_script" && fail 'Linux enables rclone --links'
 grep -Fq 'downloads.rclone.org/rclone-current-linux-' "$linux_script" ||
     fail 'Linux does not install rclone from the official current package'
 grep -Fq 'fuse3' "$linux_script" || fail 'Linux does not install fuse3'
+grep -Fq 'bindfs' "$linux_script" || fail 'Linux does not install bindfs for FUSE home mounts'
+grep -Fq -- '--no-allow-other' "$linux_script" || fail 'Linux bindfs enables FUSE allow-other'
 grep -Fq 'cleanup_rclone_mounts' "$linux_script" || fail 'Linux does not clean up rclone mounts'
 
 run_core="$(grep -nF 'enable_core_session' "$linux_script" | tail -n1 | cut -d: -f1)"

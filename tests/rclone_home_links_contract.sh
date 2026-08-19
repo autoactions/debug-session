@@ -89,13 +89,16 @@ enable_output="$(enable_rclone_home_links 2>&1)" || fail 'enable_rclone_home_lin
 [[ ! -e "$home/.agents" ]] || fail 'home link was created without a live rclone mount'
 
 src_root="$(mktemp -d)"
+fuse_backing="$(mktemp -d)"
+fuse_root="$(mktemp -d)"
 unmount_test_binds() {
     local path
-    for path in "$home/.agents" "$home/.empty" "$home/.grok/sessions" "$home/.grok/config.toml"; do
+    for path in "$home/.agents" "$home/.empty" "$home/.grok/sessions" "$home/.grok/config.toml" \
+        "$home/.local/state/yitang-archive/auth-sessions" "$fuse_root"; do
         unmount_home_bind "$path"
     done
 }
-trap 'unmount_test_binds; rm -rf -- "$home" "$src_root"' EXIT
+trap 'unmount_test_binds; rm -rf -- "$home" "$src_root" "$fuse_backing" "$fuse_root"' EXIT
 
 mkdir -p "$src_root/drive/dotfiles/agents" "$src_root/drive/other" "$src_root/koofr/Home/.grok/sessions"
 printf 'agent\n' >"$src_root/drive/dotfiles/agents/readme"
@@ -190,6 +193,33 @@ fi
 ln -s -- rclone/drive/leftover "$home/.agents"
 cleanup_rclone_home_mounts
 [[ ! -L "$home/.agents" ]] || fail 'cleanup_rclone_home_mounts left a leftover symlink'
+
+if ! command -v bindfs >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y bindfs fuse3 >/dev/null
+fi
+command -v bindfs >/dev/null 2>&1 || fail 'bindfs is required to test FUSE subdirectory mounts'
+mkdir -p "$fuse_backing/auth-sessions"
+printf 'sess\n' >"$fuse_backing/auth-sessions/token"
+bindfs --no-allow-other "$fuse_backing" "$fuse_root" ||
+    fail 'could not create a FUSE fixture for the rclone subdirectory case'
+mountpoint -q "$fuse_root" || fail 'FUSE fixture is not mounted'
+if sudo mount --bind "$fuse_root/auth-sessions" "$(mktemp -d)" 2>/dev/null; then
+    fail 'sudo mount --bind unexpectedly succeeded on a FUSE subdirectory'
+fi
+mkdir -p "$home/.local/state/yitang-archive"
+install_home_bind "$home/.local/state/yitang-archive/auth-sessions" "$fuse_root/auth-sessions" dir ||
+    fail 'install_home_bind failed for a FUSE subdirectory'
+mountpoint -q "$home/.local/state/yitang-archive/auth-sessions" ||
+    fail 'FUSE subdirectory was not mounted at the home destination'
+[[ ! -L "$home/.local/state/yitang-archive/auth-sessions" ]] ||
+    fail 'FUSE subdirectory mount created a symlink'
+[[ "$(cat -- "$home/.local/state/yitang-archive/auth-sessions/token")" == $'sess' ]] ||
+    fail 'FUSE subdirectory mount did not expose source files'
+home_bind_matches "$home/.local/state/yitang-archive/auth-sessions" "$fuse_root/auth-sessions" ||
+    fail 'FUSE subdirectory mount does not match the source'
+install_home_bind "$home/.local/state/yitang-archive/auth-sessions" "$fuse_root/auth-sessions" dir ||
+    fail 'install_home_bind was not idempotent for a FUSE subdirectory'
 
 [[ "$(rclone_writeback_wait_seconds)" == 120 ]] ||
     fail 'rclone write-back wait is not 120 seconds'
