@@ -245,7 +245,7 @@ if ($windowsScript -match 'Desktop\\STOP_SESSION') {
 if ($windowsScript -notmatch 'Enable-RcloneMounts') {
     throw 'Windows does not provision rclone mounts'
 }
-if ($windowsScript -notmatch "Join-Path \$env:USERPROFILE 'rclone'") {
+if ($windowsScript -notmatch 'Join-Path \$env:USERPROFILE ''rclone''') {
     throw 'Windows does not mount remotes under the user rclone directory'
 }
 if ($windowsScript -notmatch 'Initialize-RcloneWindowsMountPoint') {
@@ -278,7 +278,10 @@ if ($windowsScript -notmatch 'Enable-GitWorkspaces') {
 if ($windowsScript -notmatch 'function Get-GitWorkspaceDestination') {
     throw 'Windows does not resolve git workspace destinations under the user profile'
 }
-if ($windowsScript -match "Join-Path \$env:USERPROFILE 'workspaces'") {
+if ($windowsScript -match '(?i)\$home\s*=') {
+    throw 'Windows assigns the read-only $HOME automatic variable'
+}
+if ($windowsScript -match 'Join-Path \$env:USERPROFILE ''workspaces''') {
     throw 'Windows still clones git workspaces under the user workspaces directory'
 }
 if ($windowsScript -notmatch 'Sync-GitWorkspaces') {

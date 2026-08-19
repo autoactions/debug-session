@@ -1687,14 +1687,14 @@ function Test-GitWorkspaceDestinationValid {
     if ([string]::IsNullOrWhiteSpace($Destination) -or [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
         return $false
     }
-    $home = [IO.Path]::GetFullPath($env:USERPROFILE)
+    $profileRoot = [IO.Path]::GetFullPath($env:USERPROFILE)
     try {
         $dest = [IO.Path]::GetFullPath($Destination)
     } catch {
         return $false
     }
-    $rclone = [IO.Path]::GetFullPath((Join-Path $home 'rclone'))
-    if ($dest -eq $home) {
+    $rclone = [IO.Path]::GetFullPath((Join-Path $profileRoot 'rclone'))
+    if ($dest -eq $profileRoot) {
         return $false
     }
     $prefix = $rclone + [IO.Path]::DirectorySeparatorChar
