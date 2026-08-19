@@ -55,7 +55,6 @@ jobs:
           test "$hostname" = debug-session-smoke-linux
       - name: Verify Linux Developer Profile
         run: |
-          command -v code
           command -v codex
           command -v grok
           command -v zsh
@@ -181,7 +180,7 @@ jobs:
       - name: Verify Windows Developer Profile
         shell: pwsh
         run: |
-          Get-Command code.cmd, codex.cmd, grok.cmd -ErrorAction Stop
+          Get-Command codex.cmd, grok.cmd -ErrorAction Stop
           if ('${{ inputs.enable_wsl }}' -eq 'true') {
             if ((wsl.exe --distribution Ubuntu --exec id -un).Trim() -ne 'runneradmin') {
               throw 'The WSL Environment user is not ready'

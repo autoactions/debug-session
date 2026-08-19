@@ -526,37 +526,17 @@ function Enter-CoreSession {
 
     Enable-CoreSession -TailscaleIp $tailscaleIp
     Install-StopSessionCommand
-    Write-Output '[debug-session] Windows Core Session ready; Developer Profile provisioning may continue'
+    Write-Output "[debug-session] Windows Core Session ready ($(Get-SessionElapsedSeconds)s elapsed); Developer Profile provisioning may continue"
     Write-Output "RDP: $tailscaleIp`:3389"
     Write-Output "SSH: runneradmin@$tailscaleIp"
     Write-Output 'Stop Signal: run stop-session'
 }
 
-function Install-VSCodePackage {
-    try {
-        $os = switch (Get-WindowsNativeArch) {
-            'amd64' { 'win32-x64' }
-            'arm64' { 'win32-arm64' }
-            'x86' { 'win32' }
-        }
-        $installer = Join-Path $env:TEMP "vscode-setup-$os.exe"
-        try {
-            Invoke-WebRequest -Uri "https://update.code.visualstudio.com/latest/$os/stable" `
-                -OutFile $installer -UseBasicParsing
-            $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
-                '/verysilent', '/norestart', '/mergetasks=!runcode'
-            )
-            if ($process.ExitCode -notin @(0, 1641, 3010)) {
-                return $false
-            }
-        } finally {
-            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-        }
-        Sync-ProcessPath
-        return [bool](Get-Command code.cmd -ErrorAction SilentlyContinue)
-    } catch {
-        return $false
+function Get-SessionElapsedSeconds {
+    if ($null -eq $script:SessionStartedAt) {
+        $script:SessionStartedAt = Get-Date
     }
+    return [int]((Get-Date) - $script:SessionStartedAt).TotalSeconds
 }
 
 function Install-NodeJsPackage {
@@ -607,12 +587,6 @@ function Install-NodeJsPackage {
 function Install-DeveloperProfile {
     $failed = [System.Collections.Generic.List[string]]::new()
 
-    if (-not (Get-Command code.cmd -ErrorAction SilentlyContinue)) {
-        if (-not (Install-VSCodePackage)) {
-            $failed.Add('vscode')
-        }
-    }
-
     if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
         if (-not (Install-NodeJsPackage)) {
             $failed.Add('codex')
@@ -633,7 +607,7 @@ function Install-DeveloperProfile {
     if ($failed.Count -gt 0) {
         Write-Warning "Developer Profile is incomplete; failed tools: $($failed -join ', ')"
     } else {
-        Write-Output '[debug-session] Windows Developer Profile complete'
+        Write-Output "[debug-session] Windows Developer Profile complete ($(Get-SessionElapsedSeconds)s elapsed)"
     }
 }
 
@@ -2098,6 +2072,7 @@ function Sync-GitWorkspaces {
 }
 
 function Enter-DebugSession {
+    $script:SessionStartedAt = Get-Date
     $inputs = Get-ValidatedSessionInput
     Enter-CoreSession
     Enable-RcloneMounts

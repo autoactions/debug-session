@@ -70,13 +70,21 @@ apt_prerequisites_present() {
         [[ -f /etc/ssl/certs/ca-certificates.crt ]]
 }
 
+run_apt_update() {
+    sudo apt-get update -o Acquire::Retries=3
+}
+
+run_apt_install() {
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::Retries=3 "$@"
+}
+
 ensure_apt_prerequisites() {
     if apt_prerequisites_present; then
         return 0
     fi
 
-    sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+    run_apt_update
+    run_apt_install ca-certificates curl gnupg
 }
 
 configure_tailscale_repository() {
@@ -98,13 +106,11 @@ core_package_present() {
 }
 
 ensure_zsh_login_shell() {
-    if ! command -v zsh >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zsh || return 1
-    fi
-
     local zsh_path
-    zsh_path="$(command -v zsh)" || return 1
+    zsh_path="$(command -v zsh)" || {
+        printf 'zsh is not installed\n' >&2
+        return 1
+    }
     sudo chsh -s "$zsh_path" "$(id -un)"
 
     # A missing ~/.zshrc makes interactive zsh run zsh-newuser-install.
@@ -121,28 +127,46 @@ ensure_zsh_login_shell() {
 ensure_core_packages() {
     local need_sshd=0
     local need_tailscale=0
+    local need_zsh=0
+    local need_git=0
     core_package_present sshd || need_sshd=1
     core_package_present tailscale || need_tailscale=1
+    core_package_present zsh || need_zsh=1
+    core_package_present git || need_git=1
 
-    if (( need_sshd == 0 && need_tailscale == 0 )); then
+    if (( need_sshd == 0 && need_tailscale == 0 && need_zsh == 0 && need_git == 0 )); then
         return 0
     fi
 
     if (( need_tailscale )); then
         configure_tailscale_repository
     fi
-    sudo apt-get update
+    run_apt_update
     local -a packages=()
     (( need_sshd )) && packages+=(openssh-server)
     (( need_tailscale )) && packages+=(tailscale)
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    (( need_zsh )) && packages+=(zsh)
+    (( need_git )) && packages+=(git)
+    run_apt_install "${packages[@]}"
 }
 
-configure_vscode_repository() {
-    curl -fsSL 'https://packages.microsoft.com/keys/microsoft.asc' |
-        sudo gpg --dearmor --yes -o /usr/share/keyrings/packages.microsoft.gpg
-    printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' |
-        sudo tee /etc/apt/sources.list.d/vscode.list >/dev/null
+ensure_post_core_packages() {
+    local -a packages=()
+    if rclone_config_present; then
+        if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+            packages+=(fuse3)
+        fi
+        command -v unzip >/dev/null 2>&1 || packages+=(unzip)
+        command -v bindfs >/dev/null 2>&1 || packages+=(bindfs)
+    fi
+    if [[ "$SESSION_PROFILE" == developer ]] && ! command -v npm >/dev/null 2>&1; then
+        packages+=(nodejs npm)
+    fi
+    if (( ${#packages[@]} == 0 )); then
+        return 0
+    fi
+    run_apt_update
+    run_apt_install "${packages[@]}"
 }
 
 assert_private_listener() {
@@ -329,6 +353,7 @@ join_private_network() {
 }
 
 enable_core_session() {
+    log 'begin Core Session'
     validate_inputs
     require_oauth_session_inputs
 
@@ -379,11 +404,7 @@ EOF
     sudo install -m 0755 "$stop_session" /usr/local/bin/stop-session
     rm -f -- "$stop_session"
 
-    if [[ "$SESSION_PROFILE" == developer ]]; then
-        install_oh_my_zsh || warn 'Oh My Zsh is unavailable; zsh login remains without it'
-    fi
-
-    log "Linux $ACCESS_PROFILE Core Session ready; Developer Profile provisioning may continue"
+    log "Linux $ACCESS_PROFILE Core Session ready (${SECONDS}s elapsed); Developer Profile provisioning may continue"
     printf 'SSH: %s@%s\n' "$session_user" "$tailscale_ip"
     printf 'Stop Signal: run stop-session\n'
 }
@@ -398,7 +419,7 @@ enable_xfce_rdp() {
 
     sudo systemctl stop xrdp 2>/dev/null || true
     sudo systemctl mask --runtime xrdp.service >/dev/null || true
-    if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dbus-x11 xorg xfce4 xrdp; then
+    if ! run_apt_install dbus-x11 xorg xfce4 xrdp; then
         warn 'Linux RDP Access Channel failed to install; SSH remains available'
         return 1
     fi
@@ -479,7 +500,8 @@ install_herdr() {
 }
 
 install_oh_my_zsh() {
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git zsh || return
+    command -v git >/dev/null 2>&1 || return
+    command -v zsh >/dev/null 2>&1 || return
 
     umask 022
     local install_dir="$HOME/.oh-my-zsh"
@@ -517,22 +539,9 @@ install_oh_my_zsh() {
 install_developer_profile() {
     local -a failed=()
 
-    if ! command -v code >/dev/null 2>&1; then
-        if configure_vscode_repository && sudo apt-get update &&
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y code; then
-            :
-        else
-            failed+=(vscode)
-        fi
-    fi
-
     if ! command -v npm >/dev/null 2>&1; then
-        if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; then
-            failed+=(codex grok)
-        fi
-    fi
-
-    if command -v npm >/dev/null 2>&1; then
+        failed+=(codex grok)
+    else
         if ! command -v codex >/dev/null 2>&1 && ! npm install --global @openai/codex; then
             failed+=(codex)
         fi
@@ -552,7 +561,7 @@ install_developer_profile() {
     if (( ${#failed[@]} > 0 )); then
         warn "Developer Profile is incomplete; failed tools: ${failed[*]}"
     else
-        log 'Linux Developer Profile complete'
+        log "Linux Developer Profile complete (${SECONDS}s elapsed)"
     fi
 }
 
@@ -675,8 +684,8 @@ ensure_rclone_and_fuse() {
         pkgs+=(bindfs)
     fi
     if (( ${#pkgs[@]} > 0 )); then
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+        run_apt_update
+        run_apt_install "${pkgs[@]}"
     fi
 
     if command -v rclone >/dev/null 2>&1; then
@@ -1406,8 +1415,8 @@ ensure_git() {
     if command -v git >/dev/null 2>&1; then
         return 0
     fi
-    sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git
+    run_apt_update
+    run_apt_install git
 }
 
 clone_git_workspace() {
@@ -1558,14 +1567,22 @@ sync_git_workspaces() {
 
 run_session() {
     enable_core_session
+    if ! ensure_post_core_packages; then
+        warn 'post-core packages failed; Cloud Mounts or Developer Profile tools may be incomplete'
+    fi
     enable_rclone_mounts
     enable_rclone_home_links
     enable_git_workspaces
+    local dev_pid=""
+    if [[ "$SESSION_PROFILE" == developer ]]; then
+        install_developer_profile &
+        dev_pid=$!
+    fi
     if [[ "$ACCESS_PROFILE" == full ]]; then
         enable_xfce_rdp || true
     fi
-    if [[ "$SESSION_PROFILE" == developer ]]; then
-        install_developer_profile
+    if [[ -n "$dev_pid" ]]; then
+        wait "$dev_pid" || true
     fi
     wait_for_stop
 }

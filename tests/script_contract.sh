@@ -84,6 +84,21 @@ grep -Fq 'core_package_present tailscale' "$linux_script" ||
     fail 'Linux does not check for a preinstalled Tailscale before installing'
 grep -Fq 'core_package_present sshd' "$linux_script" ||
     fail 'Linux does not check for a preinstalled OpenSSH Server before installing'
+grep -Fq 'core_package_present zsh' "$linux_script" ||
+    fail 'Linux does not check for a preinstalled zsh before installing'
+if awk '/^ensure_zsh_login_shell\(\)/,/^}/' "$linux_script" | grep -Fq 'apt-get'; then
+    fail 'Linux still installs zsh inside ensure_zsh_login_shell'
+fi
+if awk '/^ensure_core_packages\(\)/,/^}/' "$linux_script" | grep -Fq 'packages+=(zsh)'; then
+    :
+else
+    fail 'Linux does not install zsh in the Core Session apt batch'
+fi
+if grep -Fq 'configure_vscode_repository' "$linux_script" ||
+    grep -Eq 'apt-get install .* code' "$linux_script" ||
+    grep -Fq 'packages.microsoft.com/repos/code' "$linux_script"; then
+    fail 'Linux still installs VS Code'
+fi
 
 install_line="$(grep -nF 'sudo install -d -o root -g root -m 0755 /run/sshd' "$linux_script" | cut -d: -f1)"
 sshd_test_line="$(grep -nF 'sudo sshd -t' "$linux_script" | cut -d: -f1)"
@@ -121,9 +136,12 @@ grep -Fq 'skip_global_compinit=1' "$linux_script" ||
 if ! awk '/^ensure_zsh_login_shell\(\)/,/^}/' "$linux_script" | grep -Fq 'skip_global_compinit=1'; then
     fail 'Linux does not skip Ubuntu global zsh compinit before the first zsh login'
 fi
-omz_line="$(grep -nE '^[[:space:]]+install_oh_my_zsh( |$|\|\|)' "$linux_script" | head -n1 | cut -d: -f1)"
-[[ -n "$omz_line" && -n "$ready_line" && "$omz_line" -lt "$ready_line" ]] ||
-    fail 'Linux does not install Oh My Zsh before announcing Core Session ready'
+if awk '/^enable_core_session\(\)/,/^}/' "$linux_script" | grep -Fq 'install_oh_my_zsh'; then
+    fail 'Linux still installs Oh My Zsh before announcing Core Session ready'
+fi
+if ! awk '/^install_developer_profile\(\)/,/^}/' "$linux_script" | grep -Fq 'install_oh_my_zsh'; then
+    fail 'Linux Developer Profile does not install Oh My Zsh'
+fi
 
 grep -Fq '/usr/local/bin/stop-session' "$linux_script" ||
     fail 'Linux does not install the stop-session command on PATH'
@@ -155,12 +173,18 @@ printf '%s\n' "$ready_after_links" | grep -Fq 'enable_rclone_home_links' ||
     fail 'Linux run_session is missing rclone home links'
 printf '%s\n' "$ready_after_links" | grep -Fq 'enable_git_workspaces' ||
     fail 'Linux run_session is missing git workspaces'
+printf '%s\n' "$ready_after_links" | grep -Fq 'install_developer_profile' ||
+    fail 'Linux run_session is missing developer profile'
+printf '%s\n' "$ready_after_links" | grep -Fq 'wait_for_stop' ||
+    fail 'Linux run_session is missing wait_for_stop'
+core_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'enable_core_session' | head -n1 | cut -d: -f1)"
 links_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'enable_rclone_home_links' | head -n1 | cut -d: -f1)"
 workspaces_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'enable_git_workspaces' | head -n1 | cut -d: -f1)"
 developer_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'install_developer_profile' | head -n1 | cut -d: -f1)"
-[[ -n "$links_line" && -n "$workspaces_line" && -n "$developer_line" ]] ||
-    fail 'Linux run_session is missing home links, git workspaces, or developer profile'
-(( links_line < workspaces_line && workspaces_line < developer_line )) ||
+wait_line="$(printf '%s\n' "$ready_after_links" | grep -nF 'wait_for_stop' | head -n1 | cut -d: -f1)"
+[[ -n "$core_line" && -n "$links_line" && -n "$workspaces_line" && -n "$developer_line" && -n "$wait_line" ]] ||
+    fail 'Linux run_session is missing home links, git workspaces, developer profile, or wait_for_stop'
+(( core_line < links_line && links_line < workspaces_line && workspaces_line < developer_line && developer_line < wait_line )) ||
     fail 'Linux does not clone git workspaces after home links and before the Developer Profile'
 
 grep -Fq 'https://herdr.dev/latest.json' "$linux_script" ||

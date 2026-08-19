@@ -73,6 +73,10 @@ assert_contains "$smoke_workflow" 'bash scripts/linux.sh run'
 assert_contains "$smoke_workflow" './scripts/windows.ps1 run'
 assert_contains "$smoke_workflow" 'debug-session-smoke-linux'
 assert_contains "$smoke_workflow" 'debug-session-smoke-windows'
+if grep -E 'command -v code[[:space:]]*$' "$smoke_workflow"; then
+    fail "$smoke_workflow still checks for the code binary"
+fi
+assert_not_contains "$smoke_workflow" 'code.cmd'
 
 for workflow in "$linux_workflow" "$windows_workflow" "$smoke_workflow"; do
     # shellcheck disable=SC2016

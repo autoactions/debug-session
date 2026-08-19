@@ -19,8 +19,6 @@ codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /
 check_url 'Tailscale Ubuntu signing key' "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg"
 check_url 'Tailscale Ubuntu repository' "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list"
 check_url 'Tailscale Windows stable index' 'https://pkgs.tailscale.com/stable/?mode=json'
-check_url 'VS Code apt repository' 'https://packages.microsoft.com/repos/code/dists/stable/Release'
-check_url 'VS Code Windows release index' 'https://update.code.visualstudio.com/api/releases/stable'
 check_url 'Node.js distribution index' 'https://nodejs.org/dist/index.json'
 check_url 'Herdr latest manifest' 'https://herdr.dev/latest.json'
 check_url 'rclone Linux amd64 package' 'https://downloads.rclone.org/rclone-current-linux-amd64.zip'
