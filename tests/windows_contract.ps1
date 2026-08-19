@@ -416,11 +416,15 @@ if ($closeRclone -lt 0 -or $logout -lt 0 -or $closeRclone -ge $logout) {
 }
 
 $closeFn = $windowsScript.IndexOf('function Close-RcloneMounts')
+$homeClose = $windowsScript.IndexOf('Close-RcloneHomeMounts', $closeFn)
 $waitRclone = $windowsScript.IndexOf('Wait-RcloneExit', $closeFn)
 $forceKill = $windowsScript.IndexOf('Stop-Process -Force', $closeFn)
 $cacheRemove = $windowsScript.IndexOf("Join-Path `$env:LOCALAPPDATA 'rclone'", $closeFn)
-if ($closeFn -lt 0 -or $waitRclone -lt 0 -or $forceKill -lt 0 -or $cacheRemove -lt 0) {
-    throw 'Windows cleanup is missing VFS write-back wait, force-kill fallback, or cache removal'
+if ($closeFn -lt 0 -or $homeClose -lt 0 -or $waitRclone -lt 0 -or $forceKill -lt 0 -or $cacheRemove -lt 0) {
+    throw 'Windows cleanup is missing home unmount, VFS write-back wait, force-kill fallback, or cache removal'
+}
+if (-not ($homeClose -lt $waitRclone -and $waitRclone -lt $forceKill -and $forceKill -lt $cacheRemove)) {
+    throw 'Windows does not close home mounts before waiting for rclone to exit'
 }
 if (-not ($waitRclone -lt $forceKill -and $forceKill -lt $cacheRemove)) {
     throw 'Windows does not wait for rclone to exit before force-killing it and deleting the VFS cache'
@@ -474,16 +478,6 @@ New-Item -Path $scratchRoot -ItemType Directory | Out-Null
 $previousProfile = $env:USERPROFILE
 try {
     $env:USERPROFILE = $scratchRoot
-    $nestedRel = ConvertTo-RcloneHomeLinkRelativeTarget -Source 'koofr/Home/.grok/sessions' `
-        -Destination (Join-Path (Join-Path $scratchRoot '.grok') 'sessions')
-    if ($nestedRel -ne '..\rclone\koofr\Home\.grok\sessions') {
-        throw "ConvertTo-RcloneHomeLinkRelativeTarget returned $nestedRel"
-    }
-    $topRel = ConvertTo-RcloneHomeLinkRelativeTarget -Source 'drive/dotfiles/agents' `
-        -Destination (Join-Path $scratchRoot '.agents')
-    if ($topRel -ne 'rclone\drive\dotfiles\agents') {
-        throw "ConvertTo-RcloneHomeLinkRelativeTarget top-level returned $topRel"
-    }
     foreach ($rel in @(
             'rclone\drive\dotfiles\agents',
             'rclone\drive\other',
@@ -492,50 +486,65 @@ try {
         )) {
         New-Item -Path (Join-Path $scratchRoot $rel) -ItemType Directory -Force | Out-Null
     }
+    $agentsSrc = Join-Path $scratchRoot 'rclone\drive\dotfiles\agents'
+    $otherSrc = Join-Path $scratchRoot 'rclone\drive\other'
+    $emptySrc = Join-Path $scratchRoot 'rclone\drive\empty'
+    $nestedSrc = Join-Path $scratchRoot 'rclone\koofr\Home\.grok\sessions'
     $dest = Join-Path $scratchRoot '.agents'
-    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
-        throw 'Install-HomeSymlink failed for a missing destination'
+    if (-not (Install-HomeBind -Destination $dest -SourcePath $agentsSrc)) {
+        throw 'Install-HomeBind failed for a missing destination'
     }
     $created = Get-Item -LiteralPath $dest -Force
-    if ($created.LinkType -notin @('SymbolicLink', 'Junction')) {
-        throw "Install-HomeSymlink did not create a link: LinkType=$($created.LinkType)"
+    if ($created.LinkType -ne 'Junction') {
+        throw "Install-HomeBind did not create a junction: LinkType=$($created.LinkType)"
     }
-    if (-not (Test-HomeLinkMatches -Item $created -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
-        throw "Install-HomeSymlink target was $(@($created.Target)[0])"
+    if (-not (Test-HomeBindMatches -Item $created -SourcePath $agentsSrc)) {
+        throw "Install-HomeBind target was $(@($created.Target)[0])"
     }
-    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\dotfiles\agents')) {
-        throw 'Install-HomeSymlink was not idempotent for the same target'
+    if (-not (Install-HomeBind -Destination $dest -SourcePath $agentsSrc)) {
+        throw 'Install-HomeBind was not idempotent for the same target'
     }
-    if (-not (Install-HomeSymlink -Destination $dest -RelativeTarget 'rclone\drive\other')) {
-        throw 'Install-HomeSymlink did not replace a wrong symlink'
+    if (-not (Install-HomeBind -Destination $dest -SourcePath $otherSrc)) {
+        throw 'Install-HomeBind did not replace a wrong junction'
+    }
+    $replaced = Get-Item -LiteralPath $dest -Force
+    if ($replaced.LinkType -ne 'Junction') {
+        throw "replaced home mount is not a junction: LinkType=$($replaced.LinkType)"
+    }
+    if (-not (Test-HomeBindMatches -Item $replaced -SourcePath $otherSrc)) {
+        throw "wrong junction was not replaced: $(@($replaced.Target)[0])"
     }
     $empty = Join-Path $scratchRoot '.empty'
     New-Item -Path $empty -ItemType Directory | Out-Null
-    if (-not (Install-HomeSymlink -Destination $empty -RelativeTarget 'rclone\drive\empty')) {
-        throw 'Install-HomeSymlink did not replace an empty directory'
+    if (-not (Install-HomeBind -Destination $empty -SourcePath $emptySrc)) {
+        throw 'Install-HomeBind did not replace an empty directory'
+    }
+    $emptyItem = Get-Item -LiteralPath $empty -Force
+    if ($emptyItem.LinkType -ne 'Junction') {
+        throw "empty directory was not replaced with a junction: LinkType=$($emptyItem.LinkType)"
     }
     $full = Join-Path $scratchRoot '.full'
     New-Item -Path (Join-Path $full 'keep') -ItemType Directory -Force | Out-Null
-    if (Install-HomeSymlink -Destination $full -RelativeTarget 'rclone\drive\full') {
-        throw 'Install-HomeSymlink replaced a non-empty directory'
+    if (Install-HomeBind -Destination $full -SourcePath $agentsSrc) {
+        throw 'Install-HomeBind replaced a non-empty directory'
     }
     $file = Join-Path $scratchRoot '.file'
     Set-Content -LiteralPath $file -Value 'x'
-    if (Install-HomeSymlink -Destination $file -RelativeTarget 'rclone\drive\file') {
-        throw 'Install-HomeSymlink replaced a regular file'
+    if (Install-HomeBind -Destination $file -SourcePath $agentsSrc) {
+        throw 'Install-HomeBind replaced a regular file'
     }
     $nestedParent = Join-Path $scratchRoot '.grok'
     $nested = Join-Path $nestedParent 'sessions'
     New-Item -Path $nestedParent -ItemType Directory -Force | Out-Null
-    if (-not (Install-HomeSymlink -Destination $nested -RelativeTarget '..\rclone\koofr\Home\.grok\sessions')) {
-        throw 'Install-HomeSymlink failed for a nested destination'
+    if (-not (Install-HomeBind -Destination $nested -SourcePath $nestedSrc)) {
+        throw 'Install-HomeBind failed for a nested destination'
     }
     $nestedItem = Get-Item -LiteralPath $nested -Force
-    if ($nestedItem.LinkType -notin @('SymbolicLink', 'Junction')) {
-        throw "Install-HomeSymlink did not create a nested link: LinkType=$($nestedItem.LinkType)"
+    if ($nestedItem.LinkType -ne 'Junction') {
+        throw "Install-HomeBind did not create a nested junction: LinkType=$($nestedItem.LinkType)"
     }
-    if (-not (Test-HomeLinkMatches -Item $nestedItem -Destination $nested -RelativeTarget '..\rclone\koofr\Home\.grok\sessions')) {
-        throw "Install-HomeSymlink nested target was $(@($nestedItem.Target)[0])"
+    if (-not (Test-HomeBindMatches -Item $nestedItem -SourcePath $nestedSrc)) {
+        throw "Install-HomeBind nested target was $(@($nestedItem.Target)[0])"
     }
     $fileSource = Join-Path $scratchRoot 'rclone\koofr\Home\.grok\config.toml'
     Ensure-RcloneHomeLinkSource -Path $fileSource -AsFile
@@ -551,15 +560,29 @@ try {
         throw 'Ensure-RcloneHomeLinkSource did not convert an empty auth.json directory into a file'
     }
     $fileDest = Join-Path $nestedParent 'config.toml'
-    if (-not (Install-HomeSymlink -Destination $fileDest -RelativeTarget '..\rclone\koofr\Home\.grok\config.toml' -AsFile)) {
-        throw 'Install-HomeSymlink failed for a file destination'
+    if (-not (Install-HomeBind -Destination $fileDest -SourcePath $fileSource -AsFile)) {
+        throw 'Install-HomeBind failed for a file destination'
     }
     $fileLink = Get-Item -LiteralPath $fileDest -Force
     if ($fileLink.LinkType -ne 'SymbolicLink') {
-        throw "Install-HomeSymlink did not create a file symlink: LinkType=$($fileLink.LinkType)"
+        throw "Install-HomeBind did not create a file symlink: LinkType=$($fileLink.LinkType)"
+    }
+    if (-not (Test-HomeBindMatches -Item $fileLink -SourcePath $fileSource)) {
+        throw "file home mount target was $(@($fileLink.Target)[0])"
     }
 } finally {
     $env:USERPROFILE = $previousProfile
+    foreach ($mapped in @(
+            (Join-Path $scratchRoot '.agents'),
+            (Join-Path $scratchRoot '.empty'),
+            (Join-Path (Join-Path $scratchRoot '.grok') 'sessions'),
+            (Join-Path (Join-Path $scratchRoot '.grok') 'config.toml')
+        )) {
+        try {
+            Remove-HomeReparsePoint -Path $mapped
+        } catch {
+        }
+    }
     Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 

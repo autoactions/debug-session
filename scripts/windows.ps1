@@ -1181,6 +1181,7 @@ function Wait-RcloneExit {
 }
 
 function Close-RcloneMounts {
+    Close-RcloneHomeMounts
     Get-Process -Name rclone -ErrorAction SilentlyContinue | ForEach-Object {
         & taskkill.exe /PID $_.Id 2>$null | Out-Null
     }
@@ -1363,55 +1364,14 @@ function ConvertTo-RcloneHomeLinkSourcePath {
     return ('rclone\' + ($Source -replace '/', '\'))
 }
 
-function ConvertTo-RcloneHomeLinkRelativeTarget {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
+function Get-RcloneHomeSourceFullPath {
+    param([Parameter(Mandatory = $true)][string]$Source)
 
-    $profileRoot = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
-    $parent = [IO.Path]::GetFullPath((Split-Path -Parent $Destination)).TrimEnd('\')
-    $prefix = ''
-    if ($parent.StartsWith($profileRoot, [StringComparison]::OrdinalIgnoreCase) -and $parent.Length -gt $profileRoot.Length) {
-        $suffix = $parent.Substring($profileRoot.Length).TrimStart('\')
-        $depth = @($suffix.Split('\') | Where-Object { $_ }).Count
-        if ($depth -gt 0) {
-            $prefix = ('..\' * $depth)
-        }
+    $path = $env:USERPROFILE
+    foreach ($part in (ConvertTo-RcloneHomeLinkSourcePath -Source $Source).Split('\')) {
+        $path = Join-Path $path $part
     }
-    return ($prefix + (ConvertTo-RcloneHomeLinkSourcePath -Source $Source))
-}
-
-function Test-HomeLinkRelativeTargetValid {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativeTarget)
-
-    $normalized = $RelativeTarget -replace '/', '\'
-    if ([string]::IsNullOrWhiteSpace($normalized)) {
-        return $false
-    }
-    if ($normalized.StartsWith('\') -or $normalized -match '^[A-Za-z]:') {
-        return $false
-    }
-    $seenRclone = $false
-    foreach ($part in $normalized.Split('\')) {
-        if ([string]::IsNullOrEmpty($part) -or $part -eq '.') {
-            return $false
-        }
-        if ($part -eq '..') {
-            if ($seenRclone) {
-                return $false
-            }
-            continue
-        }
-        if (-not $seenRclone) {
-            if ($part -ne 'rclone') {
-                return $false
-            }
-            $seenRclone = $true
-            continue
-        }
-    }
-    return $seenRclone
+    return [IO.Path]::GetFullPath($path)
 }
 
 function Test-HomeLinkAncestorsAreLocal {
@@ -1443,41 +1403,51 @@ function Test-HomeLinkAncestorsAreLocal {
     return $true
 }
 
-function Resolve-HomeLinkAbsoluteTarget {
-    param(
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string]$RelativeTarget
-    )
-
-    $normalized = $RelativeTarget -replace '/', '\'
-    $parent = Split-Path -Parent $Destination
-    return [IO.Path]::GetFullPath((Join-Path $parent $normalized))
-}
-
-function Test-HomeLinkMatches {
+function Test-HomeBindMatches {
     param(
         [Parameter(Mandatory = $true)]$Item,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string]$RelativeTarget
+        [Parameter(Mandatory = $true)][string]$SourcePath
     )
 
     if (-not $Item.LinkType) {
         return $false
     }
-    $normalized = $RelativeTarget -replace '/', '\'
-    $absolute = Resolve-HomeLinkAbsoluteTarget -Destination $Destination -RelativeTarget $RelativeTarget
+    $expected = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\')
     $current = (@($Item.Target)[0] -replace '/', '\')
     if ([string]::IsNullOrWhiteSpace($current)) {
         return $false
     }
-    if ($current -eq $normalized) {
-        return $true
-    }
     try {
-        return ([IO.Path]::GetFullPath($current) -eq $absolute)
+        $resolved = if ([IO.Path]::IsPathRooted($current)) {
+            [IO.Path]::GetFullPath($current).TrimEnd('\')
+        } else {
+            [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Item.FullName) $current)).TrimEnd('\')
+        }
+        return $resolved.Equals($expected, [StringComparison]::OrdinalIgnoreCase)
     } catch {
         return $false
     }
+}
+
+function Remove-HomeReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) {
+        return
+    }
+    if ($item.LinkType -eq 'Junction' -or (
+            $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        )) {
+        $rmdir = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
+            '/c', 'rmdir', $Path
+        ) -Wait -PassThru -WindowStyle Hidden
+        if ($rmdir.ExitCode -ne 0) {
+            throw "could not remove junction $Path (exit $($rmdir.ExitCode))"
+        }
+        return
+    }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
 }
 
 function Ensure-RcloneHomeLinkSource {
@@ -1503,80 +1473,84 @@ function Ensure-RcloneHomeLinkSource {
     New-Item -Path $Path -ItemType Directory -Force | Out-Null
 }
 
-function New-HomeLink {
+function New-HomeBind {
     param(
         [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string]$RelativeTarget,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
         [switch]$AsFile
     )
 
-    $normalized = $RelativeTarget -replace '/', '\'
-    $absolute = Resolve-HomeLinkAbsoluteTarget -Destination $Destination -RelativeTarget $RelativeTarget
+    $absolute = [IO.Path]::GetFullPath($SourcePath)
     $errors = [System.Collections.Generic.List[string]]::new()
 
-    try {
-        New-Item -ItemType SymbolicLink -Path $Destination -Target $normalized -ErrorAction Stop | Out-Null
-        return $true
-    } catch {
-        $errors.Add("symlink: $_")
-    }
-    if (-not $AsFile) {
+    if ($AsFile) {
         try {
-            New-Item -ItemType Junction -Path $Destination -Target $absolute -ErrorAction Stop | Out-Null
+            New-Item -ItemType SymbolicLink -Path $Destination -Target $absolute -ErrorAction Stop | Out-Null
             return $true
         } catch {
-            $errors.Add("junction: $_")
+            $errors.Add("symlink: $_")
         }
         $mklink = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
-            '/c', 'mklink', '/J', $Destination, $absolute
-        ) -Wait -PassThru -WindowStyle Hidden
-        if ($mklink.ExitCode -eq 0) {
-            return $true
-        }
-        $errors.Add("mklink /J exit $($mklink.ExitCode)")
-    } else {
-        $mklink = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
-            '/c', 'mklink', $Destination, $normalized
+            '/c', 'mklink', $Destination, $absolute
         ) -Wait -PassThru -WindowStyle Hidden
         if ($mklink.ExitCode -eq 0) {
             return $true
         }
         $errors.Add("mklink exit $($mklink.ExitCode)")
+        Write-Warning ("Could not create home file mount {0} ({1})" -f $Destination, ($errors -join '; '))
+        return $false
     }
-    Write-Warning ("Could not create home link {0} ({1})" -f $Destination, ($errors -join '; '))
+
+    try {
+        New-Item -ItemType Junction -Path $Destination -Target $absolute -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        $errors.Add("junction: $_")
+    }
+    $mklink = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @(
+        '/c', 'mklink', '/J', $Destination, $absolute
+    ) -Wait -PassThru -WindowStyle Hidden
+    if ($mklink.ExitCode -eq 0) {
+        return $true
+    }
+    $errors.Add("mklink /J exit $($mklink.ExitCode)")
+    Write-Warning ("Could not create home mount {0} ({1})" -f $Destination, ($errors -join '; '))
     return $false
 }
 
-function Install-HomeSymlink {
+function Install-HomeBind {
     param(
         [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string]$RelativeTarget,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
         [switch]$AsFile
     )
-
-    $normalized = $RelativeTarget -replace '/', '\'
-    if (-not (Test-HomeLinkRelativeTargetValid -RelativeTarget $normalized)) {
-        return $false
-    }
 
     $item = Get-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
     if ($item) {
         if ($item.LinkType) {
-            if (Test-HomeLinkMatches -Item $item -Destination $Destination -RelativeTarget $normalized) {
-                return $true
+            if (Test-HomeBindMatches -Item $item -SourcePath $SourcePath) {
+                if ($AsFile) {
+                    if ($item.LinkType -eq 'SymbolicLink') {
+                        return $true
+                    }
+                } elseif ($item.LinkType -eq 'Junction') {
+                    return $true
+                }
             }
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+            Remove-HomeReparsePoint -Path $Destination
         } elseif ($item.PSIsContainer) {
             if (-not (Test-DirectoryIsEmpty -Path $Destination)) {
                 return $false
             }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        } elseif ($AsFile -and $item.Length -eq 0) {
             Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
         } else {
             return $false
         }
     }
 
-    return (New-HomeLink -Destination $Destination -RelativeTarget $normalized -AsFile:$AsFile)
+    return (New-HomeBind -Destination $Destination -SourcePath $SourcePath -AsFile:$AsFile)
 }
 
 function Add-RcloneHomeLink {
@@ -1590,11 +1564,7 @@ function Add-RcloneHomeLink {
     foreach ($part in $Target.Split('/')) {
         $dest = Join-Path $dest $part
     }
-    $srcPath = $env:USERPROFILE
-    foreach ($part in (ConvertTo-RcloneHomeLinkSourcePath -Source $Source).Split('\')) {
-        $srcPath = Join-Path $srcPath $part
-    }
-    $rel = ConvertTo-RcloneHomeLinkRelativeTarget -Source $Source -Destination $dest
+    $srcPath = Get-RcloneHomeSourceFullPath -Source $Source
     $first = ($Source -split '/')[0]
     $mount = Join-Path (Get-RcloneCloudRoot) $first
     $parent = Split-Path -Parent $dest
@@ -1634,8 +1604,8 @@ function Add-RcloneHomeLink {
         Write-Warning "Skipping home link ${Target}: parent is not a local directory"
         return
     }
-    if (Install-HomeSymlink -Destination $dest -RelativeTarget $rel -AsFile:$asFile) {
-        Write-Output "[debug-session] home link ready: $dest -> $rel"
+    if (Install-HomeBind -Destination $dest -SourcePath $srcPath -AsFile:$asFile) {
+        Write-Output "[debug-session] home mount ready: $dest <= $srcPath"
         return
     }
     Write-Warning "Skipping home link ${Target}: $dest already exists or could not be replaced"
@@ -1657,9 +1627,39 @@ function Enable-RcloneHomeLinks {
         Write-Warning "RCLONE_HOME_LINKS is invalid after validate; skipping home links"
         return
     }
-    Write-Output "[debug-session] applying $($links.Count) rclone home link(s)"
+    Write-Output "[debug-session] applying $($links.Count) rclone home mount(s)"
     foreach ($link in $links) {
         Add-RcloneHomeLink -Target $link.Target -Source $link.Source -Kind $link.Kind
+    }
+}
+
+function Close-RcloneHomeMounts {
+    if (-not (Test-RcloneHomeLinksPresent)) {
+        return
+    }
+
+    try {
+        $links = @(Get-RcloneHomeLinks)
+    } catch {
+        return
+    }
+
+    foreach ($link in $links) {
+        $dest = $env:USERPROFILE
+        foreach ($part in $link.Target.Split('/')) {
+            $dest = Join-Path $dest $part
+        }
+        $item = Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        if (-not $item) {
+            continue
+        }
+        if ($item.LinkType -in @('SymbolicLink', 'Junction')) {
+            try {
+                Remove-HomeReparsePoint -Path $dest
+            } catch {
+                Write-Warning "Could not remove home mount ${dest}: $_"
+            }
+        }
     }
 }
 

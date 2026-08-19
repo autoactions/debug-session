@@ -95,13 +95,17 @@ jobs:
           while IFS=$'\t' read -r target source kind; do
             [[ -n "$target" ]] || continue
             dest="$HOME/$target"
-            rel="$(rclone_home_link_relative_target "$dest" "$source")"
-            [[ -L "$dest" ]] || {
-              echo "home link missing: $dest" >&2
+            src="$HOME/rclone/$source"
+            [[ ! -L "$dest" ]] || {
+              echo "home mount is a symlink: $dest" >&2
               exit 1
             }
-            [[ "$(readlink -- "$dest")" == "$rel" ]] || {
-              echo "home link $dest points at $(readlink -- "$dest"), expected $rel" >&2
+            mountpoint -q "$dest" || {
+              echo "home mount missing: $dest" >&2
+              exit 1
+            }
+            home_bind_matches "$dest" "$src" || {
+              echo "home mount $dest is not bound to $src" >&2
               exit 1
             }
           done < <(parse_rclone_home_links)
@@ -227,16 +231,20 @@ jobs:
             foreach ($part in $link.Target.Split('/')) {
               $dest = Join-Path $dest $part
             }
-            $rel = ConvertTo-RcloneHomeLinkRelativeTarget -Source $link.Source -Destination $dest
+            $src = Get-RcloneHomeSourceFullPath -Source $link.Source
             if (-not (Test-Path -LiteralPath $dest)) {
-              throw "home link missing: $dest"
+              throw "home mount missing: $dest"
             }
             $item = Get-Item -LiteralPath $dest -Force
-            if ($item.LinkType -notin @('SymbolicLink', 'Junction')) {
-              throw "home link is not a reparse point: $dest (LinkType=$($item.LinkType))"
+            if ($link.Kind -eq 'file') {
+              if ($item.LinkType -ne 'SymbolicLink') {
+                throw "home file mount is not a symlink: $dest (LinkType=$($item.LinkType))"
+              }
+            } elseif ($item.LinkType -ne 'Junction') {
+              throw "home directory mount is not a junction: $dest (LinkType=$($item.LinkType))"
             }
-            if (-not (Test-HomeLinkMatches -Item $item -Destination $dest -RelativeTarget $rel)) {
-              throw "home link $dest points at $(@($item.Target)[0]), expected $rel"
+            if (-not (Test-HomeBindMatches -Item $item -SourcePath $src)) {
+              throw "home mount $dest points at $(@($item.Target)[0]), expected $src"
             }
           }
       - name: Verify Windows git workspaces

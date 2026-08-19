@@ -761,6 +761,17 @@ unmount_rclone_path() {
     fusermount3 -u "$dir" 2>/dev/null ||
         fusermount -u "$dir" 2>/dev/null ||
         umount "$dir" 2>/dev/null ||
+        sudo umount "$dir" 2>/dev/null ||
+        true
+}
+
+unmount_home_bind() {
+    local dest="$1"
+    mountpoint -q "$dest" 2>/dev/null || return 0
+    umount "$dest" 2>/dev/null ||
+        sudo umount "$dest" 2>/dev/null ||
+        fusermount3 -u "$dest" 2>/dev/null ||
+        fusermount -u "$dest" 2>/dev/null ||
         true
 }
 
@@ -785,8 +796,28 @@ wait_for_rclone_exit() {
     return 0
 }
 
+cleanup_rclone_home_mounts() {
+    local target source kind dest
+    if ! rclone_home_links_present; then
+        return 0
+    fi
+    if ! parse_rclone_home_links >/dev/null; then
+        return 0
+    fi
+    while IFS=$'\t' read -r target source kind; do
+        [[ -n "$target" ]] || continue
+        dest="$HOME/$target"
+        if mountpoint -q "$dest" 2>/dev/null; then
+            unmount_home_bind "$dest"
+        elif [[ -L "$dest" ]]; then
+            rm -f -- "$dest" || true
+        fi
+    done < <(parse_rclone_home_links)
+}
+
 cleanup_rclone_mounts() {
     local root dir
+    cleanup_rclone_home_mounts
     root="$(rclone_cloud_root)"
     if [[ -d "$root" ]]; then
         for dir in "$root"/*; do
@@ -837,25 +868,6 @@ rclone_home_link_targets_conflict() {
     [[ "$left" == "$right" || "$left" == "$right"/* || "$right" == "$left"/* ]]
 }
 
-rclone_home_link_relative_target() {
-    local dest="$1"
-    local source="$2"
-    local dest_parent prefix='' suffix
-    local home="${HOME%/}"
-    local -a parts
-    local part
-    dest_parent="$(dirname -- "$dest")"
-    suffix="${dest_parent#"$home"}"
-    suffix="${suffix#/}"
-    if [[ -n "$suffix" ]]; then
-        IFS=/ read -ra parts <<< "$suffix"
-        for part in "${parts[@]}"; do
-            prefix="../$prefix"
-        done
-    fi
-    printf '%srclone/%s\n' "$prefix" "$source"
-}
-
 rclone_home_link_ancestors_are_local() {
     local dest="$1"
     local home="${HOME%/}"
@@ -863,6 +875,9 @@ rclone_home_link_ancestors_are_local() {
     cursor="$(dirname -- "$dest")"
     while [[ "$cursor" != "$home" && "$cursor" != '/' && "$cursor" != '.' ]]; do
         if [[ -L "$cursor" || ! -d "$cursor" ]]; then
+            return 1
+        fi
+        if mountpoint -q "$cursor" 2>/dev/null; then
             return 1
         fi
         cursor="$(dirname -- "$cursor")"
@@ -1010,36 +1025,107 @@ ensure_rclone_home_link_source() {
     fi
 }
 
-install_home_symlink() {
+home_bind_matches() {
     local dest="$1"
-    local rel="$2"
+    local src="$2"
+    local dest_id src_id
+    mountpoint -q "$dest" 2>/dev/null || return 1
+    dest_id="$(stat -c '%d:%i' "$dest" 2>/dev/null)" || return 1
+    src_id="$(stat -c '%d:%i' "$src" 2>/dev/null)" || return 1
+    [[ -n "$dest_id" && "$dest_id" == "$src_id" ]]
+}
 
-    if [[ -L "$dest" ]]; then
-        if [[ "$(readlink -- "$dest")" == "$rel" ]]; then
+bind_home_path() {
+    local src="$1"
+    local dest="$2"
+    if mount --bind "$src" "$dest" 2>/dev/null; then
+        return 0
+    fi
+    sudo mount --bind "$src" "$dest"
+}
+
+prepare_home_bind_destination() {
+    local dest="$1"
+    local src="$2"
+    local kind="$3"
+
+    if home_bind_matches "$dest" "$src"; then
+        return 0
+    fi
+    if mountpoint -q "$dest" 2>/dev/null; then
+        unmount_home_bind "$dest"
+        if home_bind_matches "$dest" "$src"; then
             return 0
         fi
-        rm -f -- "$dest" || return 1
-    elif [[ -d "$dest" ]]; then
-        if directory_is_empty "$dest"; then
-            rmdir -- "$dest" || return 1
-        else
-            return 1
-        fi
-    elif [[ -e "$dest" ]]; then
-        return 1
     fi
 
-    ln -s -- "$rel" "$dest"
+    if [[ -L "$dest" ]]; then
+        rm -f -- "$dest" || return 1
+    fi
+
+    if [[ "$kind" == 'file' ]]; then
+        if [[ -d "$dest" && ! -L "$dest" ]]; then
+            if directory_is_empty "$dest"; then
+                rmdir -- "$dest" || return 1
+            else
+                return 1
+            fi
+        fi
+        if [[ -e "$dest" && ! -f "$dest" ]]; then
+            return 1
+        fi
+        if [[ -f "$dest" ]]; then
+            if [[ -s "$dest" ]]; then
+                return 1
+            fi
+            return 2
+        fi
+        : >"$dest" || return 1
+        return 2
+    fi
+
+    if [[ -f "$dest" ]]; then
+        return 1
+    fi
+    if [[ -d "$dest" ]]; then
+        if directory_is_empty "$dest"; then
+            return 2
+        fi
+        return 1
+    fi
+    if [[ -e "$dest" ]]; then
+        return 1
+    fi
+    mkdir -p -- "$dest" || return 1
+    return 2
+}
+
+install_home_bind() {
+    local dest="$1"
+    local src="$2"
+    local kind="${3:-dir}"
+    local status
+
+    set +e
+    prepare_home_bind_destination "$dest" "$src" "$kind"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+        return 0
+    fi
+    if (( status != 2 )); then
+        return 1
+    fi
+    bind_home_path "$src" "$dest"
 }
 
 apply_rclone_home_link() {
     local target="$1"
     local source="$2"
     local kind="${3:-dir}"
-    local dest rel src_path first parent
+    local dest src_path first parent
     dest="$HOME/$target"
     src_path="$HOME/rclone/$source"
-    rel="$(rclone_home_link_relative_target "$dest" "$source")"
     first="${source%%/*}"
     parent="$(dirname -- "$dest")"
 
@@ -1072,8 +1158,8 @@ apply_rclone_home_link() {
         warn "Skipping home link ${target}: parent is not a local directory"
         return 0
     fi
-    if install_home_symlink "$dest" "$rel"; then
-        log "home link ready: ${dest} -> ${rel}"
+    if install_home_bind "$dest" "$src_path" "$kind"; then
+        log "home mount ready: ${dest} <= ${src_path}"
         return 0
     fi
     warn "Skipping home link ${target}: ${dest} already exists or could not be replaced"

@@ -91,6 +91,11 @@ ACCESS_PROFILE=mini SESSION_PROFILE=core SESSION_DEADLINE_EPOCH="$future_deadlin
 
 grep -Fq 'enable_rclone_mounts' "$linux_script" || fail 'Linux does not provision rclone mounts'
 grep -Fq 'enable_rclone_home_links' "$linux_script" || fail 'Linux does not provision rclone home links'
+grep -Fq 'install_home_bind' "$linux_script" || fail 'Linux does not bind-mount rclone home mappings'
+grep -Fq 'cleanup_rclone_home_mounts' "$linux_script" || fail 'Linux does not unmount rclone home mappings'
+grep -Fq 'install_home_symlink' "$linux_script" && fail 'Linux still installs rclone home symlinks'
+grep -Fq 'rclone_home_link_relative_target' "$linux_script" &&
+    fail 'Linux still computes relative home-link targets'
 grep -Fq -- '--vfs-cache-mode writes' "$linux_script" || fail 'Linux does not use vfs-cache-mode writes'
 grep -Fq -- '--allow-other' "$linux_script" && fail 'Linux enables FUSE allow-other'
 grep -Fq -- '--vfs-links' "$linux_script" && fail 'Linux enables rclone VFS symlink translation'
@@ -110,10 +115,13 @@ run_dev="$(grep -nF 'install_developer_profile' "$linux_script" | tail -n1 | cut
 (( run_core < run_rclone && run_rclone < run_links && run_links < run_xfce && run_links < run_dev )) ||
     fail 'Linux does not apply home links after rclone mounts and before XFCE/Developer'
 
+cleanup_home_line="$(grep -nF 'cleanup_rclone_home_mounts' "$linux_script" | tail -n1 | cut -d: -f1)"
 cleanup_rclone_line="$(grep -nF 'cleanup_rclone_mounts' "$linux_script" | tail -n1 | cut -d: -f1)"
 cleanup_logout_line="$(grep -nF 'tailscale logout' "$linux_script" | tail -n1 | cut -d: -f1)"
-[[ -n "$cleanup_rclone_line" && -n "$cleanup_logout_line" && "$cleanup_rclone_line" -lt "$cleanup_logout_line" ]] ||
-    fail 'Linux does not clean up rclone mounts before Tailscale logout'
+[[ -n "$cleanup_home_line" && -n "$cleanup_rclone_line" && -n "$cleanup_logout_line" ]] ||
+    fail 'Linux cleanup is missing home unmount, rclone unmount, or Tailscale logout'
+(( cleanup_home_line < cleanup_rclone_line && cleanup_rclone_line < cleanup_logout_line )) ||
+    fail 'Linux does not unmount home binds before rclone remotes and Tailscale logout'
 
 wait_line="$(grep -nF 'wait_for_rclone_exit' "$linux_script" | head -n1 | cut -d: -f1)"
 pkill_line="$(grep -nF 'pkill -x rclone' "$linux_script" | tail -n1 | cut -d: -f1)"
@@ -135,8 +143,9 @@ grep -Fq '$HOME"/rclone/*' "$smoke_workflow" ||
     fail 'Linux smoke does not check $HOME/rclone mounts'
 grep -Fq "Join-Path \$env:USERPROFILE 'rclone'" "$smoke_workflow" ||
     fail 'Windows smoke does not check %USERPROFILE%\\rclone mounts'
-grep -Fq 'rclone_home_link_relative_target' "$smoke_workflow" ||
-    fail 'Linux smoke does not verify nested home-link relative targets'
+# shellcheck disable=SC2016
+grep -Fq 'mountpoint -q "$dest"' "$smoke_workflow" ||
+    fail 'Linux smoke does not verify home mappings as mountpoints'
 grep -Fq 'Get-RcloneHomeLinks' "$smoke_workflow" ||
     fail 'Windows smoke does not parse home links with Get-RcloneHomeLinks'
 grep -Fq 'parse_git_workspaces' "$smoke_workflow" ||
@@ -150,11 +159,15 @@ grep -Fq 'Get-GitWorkspaceDestination' "$smoke_workflow" ||
 if grep -Fq '$HOME/workspaces/$name' "$smoke_workflow"; then
     fail 'Linux smoke still hard-codes \$HOME/workspaces dests'
 fi
-grep -Fq 'ConvertTo-RcloneHomeLinkRelativeTarget' "$smoke_workflow" ||
-    fail 'Windows smoke does not verify nested home-link relative targets'
+grep -Fq "LinkType -ne 'Junction'" "$smoke_workflow" ||
+    fail 'Windows smoke does not require directory home mappings to be junctions'
+grep -Fq 'Test-HomeBindMatches' "$smoke_workflow" ||
+    fail 'Windows smoke does not verify home mount targets'
 # shellcheck disable=SC2016
 grep -Fq 'rel="rclone/$source"' "$smoke_workflow" &&
     fail 'Linux smoke still assumes top-level rclone/$source home links'
+grep -Fq 'rclone_home_link_relative_target' "$smoke_workflow" &&
+    fail 'Linux smoke still verifies relative home-link targets'
 
 grep -Fq 'rclone_config_present' "$linux_script" || fail 'Linux does not skip rclone when the secret is empty'
 
